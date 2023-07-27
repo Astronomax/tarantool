@@ -698,7 +698,8 @@ end
 box.internal.space.denormalize_format = denormalize_format
 
 box.schema.space = {}
-box.schema.space.create = function(name, options)
+
+local function box_schema_space_create_do(name, options)
     check_param(name, 'name', 'string')
     local options_template = {
         if_not_exists = 'boolean',
@@ -769,7 +770,7 @@ box.schema.space.create = function(name, options)
 end
 
 -- space format - the metadata about space fields
-function box.schema.space.format(id, format)
+local function box_schema_space_format_do(id, format)
     local _space = box.space._space
     local _vspace = box.space._vspace
     check_param(id, 'id', 'number')
@@ -788,14 +789,12 @@ function box.schema.space.format(id, format)
     end
 end
 
-function box.schema.space.upgrade(id)
+local function box_schema_space_upgrade_do(id)
     check_param(id, 'id', 'number')
     box.error(box.error.UNSUPPORTED, "Community edition", "space upgrade")
 end
 
-box.schema.create_space = box.schema.space.create
-
-box.schema.space.drop = function(space_id, space_name, opts)
+local function box_schema_space_drop_do(space_id, space_name, opts)
     check_param(space_id, 'space_id', 'number')
     opts = opts or {}
     check_param_table(opts, { if_exists = 'boolean' })
@@ -836,7 +835,7 @@ box.schema.space.drop = function(space_id, space_name, opts)
     feedback_save_event('drop_space')
 end
 
-box.schema.space.rename = function(space_id, space_name)
+local function box_schema_space_rename_do(space_id, space_name)
     check_param(space_id, 'space_id', 'number')
     check_param(space_name, 'space_name', 'string')
 
@@ -856,7 +855,7 @@ local alter_space_template = {
     foreign_key = 'table',
 }
 
-box.schema.space.alter = function(space_id, options)
+local function box_schema_space_alter_do(space_id, options)
     local space = box.space[space_id]
     if not space then
         box.error(box.error.NO_SUCH_SPACE, '#'..tostring(space_id))
@@ -1432,7 +1431,7 @@ local function func_id_by_name(func_name)
 end
 box.internal.func_id_by_name = func_id_by_name -- for space.upgrade
 
-box.schema.index.create = function(space_id, name, options)
+local function box_schema_index_create_do(space_id, name, options)
     check_param(space_id, 'space_id', 'number')
     check_param(name, 'name', 'string')
     check_param_table(options, create_index_template)
@@ -1557,7 +1556,7 @@ box.schema.index.create = function(space_id, name, options)
     return space.index[name]
 end
 
-box.schema.index.drop = function(space_id, index_id)
+local function box_schema_index_drop_do(space_id, index_id)
     check_param(space_id, 'space_id', 'number')
     check_param(index_id, 'index_id', 'number')
     if index_id == 0 then
@@ -1578,7 +1577,7 @@ box.schema.index.drop = function(space_id, index_id)
     feedback_save_event('drop_index')
 end
 
-box.schema.index.rename = function(space_id, index_id, name)
+local function box_schema_index_rename_do(space_id, index_id, name)
     check_param(space_id, 'space_id', 'number')
     check_param(index_id, 'index_id', 'number')
     check_param(name, 'name', 'string')
@@ -1587,7 +1586,7 @@ box.schema.index.rename = function(space_id, index_id, name)
     _index:update({space_id, index_id}, {{"=", 3, name}})
 end
 
-box.schema.index.alter = function(space_id, index_id, options)
+local function box_schema_index_alter_do(space_id, index_id, options)
     local space = box.space[space_id]
     if space == nil then
         box.error(box.error.NO_SUCH_SPACE, '#'..tostring(space_id))
@@ -2756,7 +2755,7 @@ create_sequence_options.if_not_exists = 'boolean'
 local alter_sequence_options = table.deepcopy(sequence_options)
 alter_sequence_options.name = 'string'
 
-box.schema.sequence.create = function(name, opts)
+local function box_schema_sequence_create_do(name, opts)
     opts = opts or {}
     check_param(name, 'name', 'string')
     check_param_table(opts, create_sequence_options)
@@ -2783,7 +2782,7 @@ box.schema.sequence.create = function(name, opts)
     return box.sequence[name]
 end
 
-box.schema.sequence.alter = function(name, opts)
+local function box_schema_sequence_alter_do(name, opts)
     check_param_table(opts, alter_sequence_options)
     local id, tuple = sequence_resolve(name)
     if id == nil then
@@ -2801,7 +2800,7 @@ box.schema.sequence.alter = function(name, opts)
                       opts.max, opts.start, opts.cache, opts.cycle}
 end
 
-box.schema.sequence.drop = function(name, opts)
+local function box_schema_sequence_drop_do(name, opts)
     opts = opts or {}
     check_param_table(opts, {if_exists = 'boolean'})
     local id = sequence_resolve(name)
@@ -3049,7 +3048,8 @@ local function object_name(object_type, object_id)
 end
 
 box.schema.func = {}
-box.schema.func.create = function(name, opts)
+
+local function box_schema_func_create_do(name, opts)
     opts = opts or {}
     check_param_table(opts, { setuid = 'boolean',
                               if_not_exists = 'boolean',
@@ -3093,7 +3093,7 @@ box.schema.func.create = function(name, opts)
                          opts.comment, opts.created, opts.last_altered}
 end
 
-box.schema.func.drop = function(name, opts)
+local function box_schema_func_drop_do(name, opts)
     opts = opts or {}
     check_param_table(opts, { if_exists = 'boolean' })
     local _func = box.space[box.schema.FUNC_ID]
@@ -3118,7 +3118,7 @@ box.schema.func.drop = function(name, opts)
     _func:delete{fid}
 end
 
-function box.schema.func.exists(name_or_id)
+local function box_schema_func_exists_do(name_or_id)
     local _vfunc = box.space[box.schema.VFUNC_ID]
     local tuple = nil
     if type(name_or_id) == 'string' then
@@ -3226,7 +3226,7 @@ end
 
 box.schema.user = {}
 
-box.schema.user.password = function(password)
+local function box_schema_user_password_do(password)
     return internal.prepare_auth(box.cfg.auth_type, password)
 end
 
@@ -3259,7 +3259,7 @@ local function chpasswd(uid, new_password)
                          {'=', 7, math.floor(fiber.time())}})
 end
 
-box.schema.user.passwd = function(name, new_password)
+local function box_schema_user_passwd_do(name, new_password)
     if name == nil then
         box.error(box.error.PROC_LUA, "Usage: box.schema.user.passwd([user,] password)")
     end
@@ -3277,7 +3277,7 @@ box.schema.user.passwd = function(name, new_password)
     end
 end
 
-box.schema.user.create = function(name, opts)
+local function box_schema_user_create_do(name, opts)
     local uid = user_or_role_resolve(name)
     opts = opts or {}
     check_param_table(opts, { password = 'string', if_not_exists = 'boolean' })
@@ -3309,7 +3309,7 @@ box.schema.user.create = function(name, opts)
                    nil, {if_not_exists=true})
 end
 
-box.schema.user.exists = function(name)
+local function box_schema_user_exists_do(name)
     if user_resolve(name) then
         return true
     else
@@ -3467,7 +3467,7 @@ local function drop(uid)
     box.space[box.schema.USER_ID]:delete{uid}
 end
 
-box.schema.user.grant = function(user_name, ...)
+local function box_schema_user_grant_do(user_name, ...)
     local uid = user_resolve(user_name)
     if uid == nil then
         box.error(box.error.NO_SUCH_USER, user_name)
@@ -3475,7 +3475,7 @@ box.schema.user.grant = function(user_name, ...)
     return grant(uid, user_name, ...)
 end
 
-box.schema.user.revoke = function(user_name, ...)
+local function box_schema_user_revoke_do(user_name, ...)
     local uid = user_resolve(user_name)
     if uid == nil then
         box.error(box.error.NO_SUCH_USER, user_name)
@@ -3483,17 +3483,17 @@ box.schema.user.revoke = function(user_name, ...)
     return revoke(uid, user_name, ...)
 end
 
-box.schema.user.enable = function(user)
+local function box_schema_user_enable_do(user)
     box.schema.user.grant(user, "session,usage", "universe", nil,
                             {if_not_exists = true})
 end
 
-box.schema.user.disable = function(user)
+local function box_schema_user_disable_do(user)
     box.schema.user.revoke(user, "session,usage", "universe", nil,
                             {if_exists = true})
 end
 
-box.schema.user.drop = function(name, opts)
+local function box_schema_user_drop_do(name, opts)
     opts = opts or {}
     check_param_table(opts, { if_exists = 'boolean' })
     local uid = user_resolve(name)
@@ -3529,7 +3529,7 @@ local function info(id)
     return privs
 end
 
-box.schema.user.info = function(user_name)
+local function box_schema_user_info_do(user_name)
     local uid
     if user_name == nil then
         uid = box.session.euid()
@@ -3544,7 +3544,7 @@ end
 
 box.schema.role = {}
 
-box.schema.role.exists = function(name)
+local function box_schema_role_exists_do(name)
     if role_resolve(name) then
         return true
     else
@@ -3552,7 +3552,7 @@ box.schema.role.exists = function(name)
     end
 end
 
-box.schema.role.create = function(name, opts)
+local function box_schema_role_create_do(name, opts)
     opts = opts or {}
     check_param_table(opts, { if_not_exists = 'boolean' })
     local uid = user_or_role_resolve(name)
@@ -3567,7 +3567,7 @@ box.schema.role.create = function(name, opts)
                          math.floor(fiber.time())}
 end
 
-box.schema.role.drop = function(name, opts)
+local function box_schema_role_drop_do(name, opts)
     opts = opts or {}
     check_param_table(opts, { if_exists = 'boolean' })
     local uid = role_resolve(name)
@@ -3593,7 +3593,7 @@ local function role_check_grant_revoke_of_sys_priv(priv)
     end
 end
 
-box.schema.role.grant = function(user_name, ...)
+local function box_schema_role_grant_do(user_name, ...)
     local uid = role_resolve(user_name)
     if uid == nil then
         box.error(box.error.NO_SUCH_ROLE, user_name)
@@ -3601,7 +3601,8 @@ box.schema.role.grant = function(user_name, ...)
     role_check_grant_revoke_of_sys_priv(...)
     return grant(uid, user_name, ...)
 end
-box.schema.role.revoke = function(user_name, ...)
+
+local function box_schema_role_revoke_do(user_name, ...)
     local uid = role_resolve(user_name)
     if uid == nil then
         box.error(box.error.NO_SUCH_ROLE, user_name)
@@ -3609,13 +3610,66 @@ box.schema.role.revoke = function(user_name, ...)
     role_check_grant_revoke_of_sys_priv(...)
     return revoke(uid, user_name, ...)
 end
-box.schema.role.info = function(role_name)
+
+local function box_schema_role_info_do(role_name)
     local rid = role_resolve(role_name)
     if rid == nil then
         box.error(box.error.NO_SUCH_ROLE, role_name)
     end
     return info(rid)
 end
+
+-- Wrap a function into transaction if none is active.
+local function atomic_wrapper(func)
+    return function(...)
+        -- No reason to start a transaction of one is active already.
+        if box.is_in_txn() then
+            return func(...)
+        else
+            return box.atomic(func, ...)
+        end
+    end
+end
+
+box.schema.space.create = atomic_wrapper(box_schema_space_create_do)
+box.schema.space.format = atomic_wrapper(box_schema_space_format_do)
+box.schema.space.upgrade = box_schema_space_upgrade_do
+box.schema.space.drop = atomic_wrapper(box_schema_space_drop_do)
+box.schema.space.rename = atomic_wrapper(box_schema_space_rename_do)
+box.schema.space.alter = atomic_wrapper(box_schema_space_alter_do)
+
+box.schema.index.create = atomic_wrapper(box_schema_index_create_do)
+box.schema.index.drop = atomic_wrapper(box_schema_index_drop_do)
+box.schema.index.rename = atomic_wrapper(box_schema_index_rename_do)
+box.schema.index.alter = box_schema_index_alter_do
+
+box.schema.sequence.create = atomic_wrapper(box_schema_sequence_create_do)
+box.schema.sequence.alter = atomic_wrapper(box_schema_sequence_alter_do)
+box.schema.sequence.drop = atomic_wrapper(box_schema_sequence_drop_do)
+
+box.schema.func.create = atomic_wrapper(box_schema_func_create_do)
+box.schema.func.drop = atomic_wrapper(box_schema_func_drop_do)
+box.schema.func.exists = atomic_wrapper(box_schema_func_exists_do)
+
+box.schema.user.password = atomic_wrapper(box_schema_user_password_do)
+box.schema.user.passwd = atomic_wrapper(box_schema_user_passwd_do)
+box.schema.user.create = atomic_wrapper(box_schema_user_create_do)
+box.schema.user.exists = atomic_wrapper(box_schema_user_exists_do)
+box.schema.user.grant = atomic_wrapper(box_schema_user_grant_do)
+box.schema.user.revoke = atomic_wrapper(box_schema_user_revoke_do)
+box.schema.user.enable = atomic_wrapper(box_schema_user_enable_do)
+box.schema.user.disable = atomic_wrapper(box_schema_user_disable_do)
+box.schema.user.drop = atomic_wrapper(box_schema_user_drop_do)
+box.schema.user.info = atomic_wrapper(box_schema_user_info_do)
+
+box.schema.role.exists = atomic_wrapper(box_schema_role_exists_do)
+box.schema.role.create = atomic_wrapper(box_schema_role_create_do)
+box.schema.role.drop = atomic_wrapper(box_schema_role_drop_do)
+box.schema.role.grant = atomic_wrapper(box_schema_role_grant_do)
+box.schema.role.revoke = atomic_wrapper(box_schema_role_revoke_do)
+box.schema.role.info = atomic_wrapper(box_schema_role_info_do)
+
+box.schema.create_space = box.schema.space.create
 
 --
 -- once
