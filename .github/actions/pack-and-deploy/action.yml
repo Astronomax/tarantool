@@ -20,6 +20,7 @@ runs:
         fi
 
         make -f .pack.mk ${PACKAGE_TARGET}
+        REPO_TYPE=release make -f .pack.mk ${DEPLOY_TARGET}
 
         # Deploy pre-release (since 2.10) and release packages. It's expected
         # that no one will push tags are used for pre-releases and releases.

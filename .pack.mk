@@ -3,7 +3,7 @@
 #
 
 SED_REPLACE_VERSION_REGEX = 's/-\([0-9]\+\)-g[0-9a-f]\+$$/.\1/'
-RWS_BASE_URL = https://rws.tarantool.org
+RWS_BASE_URL = https://rws-dev.tarantool.org
 PRODUCT_NAME = tarantool
 
 VARDIR ?=/tmp/t
