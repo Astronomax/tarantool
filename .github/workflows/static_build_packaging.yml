@@ -32,7 +32,7 @@ concurrency:
 
 jobs:
   static_build_packaging:
-    name: 'static_build_packaging (${{ matrix.arch }})'
+    name: 'static_build_packaging_(${{ matrix.arch }})'
 
     # Run on push to the 'master' and release branches of tarantool/tarantool
     # or on pull request if the 'full-ci' or 'static-build-ci' label is set.
@@ -59,17 +59,13 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
-      - uses: ./.github/actions/environment
-      - name: Install deps
-        uses: ./.github/actions/install-deps-debian
       - name: Build static packages
         uses: ./.github/actions/pack-and-deploy
         env:
           RWS_AUTH: ${{ secrets.RWS_AUTH }}
+      - name: Pack libraries for testing
+        run: tar cvfz build/test-libs-$(uname -m).tgz -C static-build/tarantool-prefix/src/tarantool-build/ --exclude=unit test
       - name: Upload build artifacts
-        if: github.ref == 'refs/heads/master' ||
-            startsWith(github.ref, 'refs/heads/release/') ||
-            startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v3
         with:
           name: tarantool-deb-rpm-x86_64-aarch64
@@ -77,7 +73,107 @@ jobs:
           path: |
             build/tarantool*.deb
             build/tarantool*.rpm
+            build/test-libs*.tgz
           if-no-files-found: error
+      - name: Send VK Teams message on failure
+        if: failure()
+        uses: ./.github/actions/report-job-status
+        with:
+          bot-token: ${{ secrets.VKTEAMS_BOT_TOKEN }}
+
+  static_build_testing:
+    name: 'static_build_testing_${{ matrix.sys-arch }}_${{ matrix.os }}'
+
+    # Run on push to the 'master' and release branches of tarantool/tarantool
+    # or on pull request if the 'full-ci' or 'static-build-ci' label is set.
+    if: github.repository == 'tarantool/tarantool' &&
+        ( github.event_name != 'pull_request' ||
+          contains(github.event.pull_request.labels.*.name, 'full-ci') ||
+          contains(github.event.pull_request.labels.*.name, 'static-build-ci') )
+
+    runs-on: [ self-hosted, Linux, '${{ matrix.sys-arch }}', regular ]
+
+    needs: static_build_packaging
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-jammy
+            sys-arch: x86_64
+            install-tarantool: |
+              dpkg -i tarantool*$(dpkg --print-architecture).deb
+            install-requires: |
+              apt update && apt -y install python3-pip && pip install -r requirements.txt
+          - os: ubuntu-jammy
+            sys-arch: aarch64
+            install-tarantool: |
+              dpkg -i tarantool*$(dpkg --print-architecture).deb
+            install-requires: |
+              apt update && apt -y install python3-pip && pip install -r requirements.txt
+          - os: debian-bullseye
+            sys-arch: x86_64
+            install-tarantool: |
+              dpkg -i tarantool*$(dpkg --print-architecture).deb
+            install-requires: |
+              apt update && apt -y install python3-pip && pip install -r requirements.txt
+          - os: debian-bullseye
+            sys-arch: aarch64
+            install-tarantool: |
+              dpkg -i tarantool*$(dpkg --print-architecture).deb
+            install-requires: |
+              apt update && apt -y install python3-pip && pip install -r requirements.txt
+          - os: fedora-36
+            sys-arch: x86_64
+            install-tarantool: |
+              dnf -y localinstall tarantool*$(uname -m).rpm
+            install-requires: |
+              dnf -y install python3-pip e2fsprogs && pip install -r requirements.txt
+          - os: fedora-36
+            sys-arch: aarch64
+            install-tarantool: |
+              dnf -y localinstall tarantool*$(uname -m).rpm
+            install-requires: |
+              dnf -y install python3-pip e2fsprogs && pip install -r requirements.txt
+
+    container:
+      image: packpack/packpack:${{ matrix.os }}
+      # Mount /dev to the container to be able to mount a disk image inside it
+      # for successful run of the .github/actions/environment action.
+      volumes:
+        - /dev:/dev
+      # Our testing expects that the init process (PID 1) will
+      # reap orphan processes. At least the following test leans
+      # on it: app-tap/gh-4983-tnt-e-assert-false-hangs.test.lua.
+      # Add extra privileges to the container for successful run
+      # of the .github/actions/environment action.
+      options: '--init --privileged'
+
+    steps:
+      - name: Prepare checkout
+        uses: tarantool/actions/prepare-checkout@master
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Install test dependencies
+        run: ${{ matrix.install-requires }}
+        working-directory: test-run
+      - uses: ./.github/actions/environment
+      - name: Download built artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: tarantool-deb-rpm-x86_64-aarch64
+          path: build
+      - name: Prepare environment for testing (extract libraries)
+        run: tar xvfz test-libs-$(uname -m).tgz
+        working-directory: build
+      - name: Install built packages
+        run: ${{ matrix.install-tarantool }}
+        working-directory: build
+      - name: Run tests
+        run: ./test-run.py --force --builddir ../build --executable /usr/bin/tarantool
+        working-directory: test
       - name: Send VK Teams message on failure
         if: failure()
         uses: ./.github/actions/report-job-status
