@@ -1,0 +1,150 @@
+name: reusable_static_build_packaging
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: 'tags of runners to run on'
+        required: true
+        type: string
+      arch:
+        description: 'type of architecture'
+        required: true
+        type: string
+
+jobs:
+  build_static_packages:
+    name: 'static_build_packaging_${{ inputs.arch }}'
+
+    runs-on: [ '${{ inputs.runner }}', regular ]
+
+    steps:
+      - name: Prepare checkout
+        uses: tarantool/actions/prepare-checkout@master
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Build static packages
+        run: make -f .pack.mk package-static
+      - name: Pack libraries for testing
+        run: tar cvfz build/test-libs-$(uname -m).tgz -C static-build/tarantool-prefix/src/tarantool-build/ --exclude=unit test
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: tarantool-deb-rpm-${{ inputs.arch }}
+          retention-days: 21
+          path: |
+            build/tarantool*.deb
+            build/tarantool*.rpm
+            build/test-libs*.tgz
+          if-no-files-found: error
+      - name: Send VK Teams message on failure
+        if: failure()
+        uses: ./.github/actions/report-job-status
+        with:
+          bot-token: ${{ secrets.VKTEAMS_BOT_TOKEN }}
+
+  test_static_build_packages:
+    name: 'static_build_testing_${{ matrix.os }}_${{ inputs.arch }}'
+
+    runs-on: ${{ inputs.runner }}
+
+    needs: build_static_packages
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: debian-bullseye
+            install-tarantool: |
+              dpkg -i tarantool*$(dpkg --print-architecture).deb
+            install-requires: |
+              apt update && apt -y install python3-pip && pip install -r requirements.txt
+          - os: fedora-36
+            install-tarantool: |
+              dnf -y localinstall tarantool*$(uname -m).rpm
+            install-requires: |
+              dnf -y install python3-pip e2fsprogs && pip install -r requirements.txt
+
+    container:
+      image: packpack/packpack:${{ matrix.os }}
+      # Mount /dev to the container to be able to mount a disk image inside it
+      # for successful run of the .github/actions/environment action.
+      volumes:
+        - /dev:/dev
+      # Our testing expects that the init process (PID 1) will
+      # reap orphan processes. At least the following test leans
+      # on it: app-tap/gh-4983-tnt-e-assert-false-hangs.test.lua.
+      # Add extra privileges to the container for successful run
+      # of the .github/actions/environment action.
+      options: '--init --privileged'
+
+    steps:
+      - name: Prepare checkout
+        uses: tarantool/actions/prepare-checkout@master
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Install test dependencies
+        run: ${{ matrix.install-requires }}
+        working-directory: test-run
+      - uses: ./.github/actions/environment
+      - name: Download built artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: tarantool-deb-rpm-${{ inputs.arch }}
+          path: build
+      - name: Prepare environment for testing (extract libraries)
+        run: tar xvfz test-libs-$(uname -m).tgz
+        working-directory: build
+      - name: Install built packages
+        run: ${{ matrix.install-tarantool }}
+        working-directory: build
+      - name: Run tests
+        run: ./test-run.py --force --builddir ../build --executable /usr/bin/tarantool
+        working-directory: test
+      - name: Send VK Teams message on failure
+        if: failure()
+        uses: ./.github/actions/report-job-status
+        with:
+          bot-token: ${{ secrets.VKTEAMS_BOT_TOKEN }}
+
+  static_built_packages_deploy:
+    name: 'static_build_deploy_${{ inputs.arch }}'
+
+    runs-on: ${{ inputs.runner }}
+
+    needs: test_static_build_packages
+
+    steps:
+      - name: Prepare checkout
+        uses: tarantool/actions/prepare-checkout@master
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Download built artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: tarantool-deb-rpm-${{ inputs.arch }}
+          path: build
+      - name: Deploy static packages
+        run: |
+          if true || ${{ ( startsWith(github.ref, 'refs/tags/2.') ||
+                  startsWith(github.ref, 'refs/tags/3.') ) &&
+                !endsWith(github.ref, '-entrypoint') }}; then
+            case ${{ github.ref }} in
+              # It's relevant since 2.10 only.
+              refs/tags/*-alpha*|refs/tags/*-beta*|refs/tags/*-rc*)
+                REPO_TYPE=pre-release make -f .pack.mk deploy-static
+                ;;
+              refs/tags/*)
+                REPO_TYPE=release make -f .pack.mk deploy-static
+                ;;
+            esac
+            REPO_TYPE=release make -f .pack.mk deploy-static
+          fi
+        env:
+          RWS_AUTH: ${{ secrets.RWS_AUTH }}
