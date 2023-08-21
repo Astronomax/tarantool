@@ -105,7 +105,8 @@ test_key_def_new_va(const char *format, va_list ap, bool for_func_index)
 				     region) != 0);
 
 	/* Create a key def. */
-	struct key_def *def = key_def_new(part_def, part_count, for_func_index);
+	struct key_def *def = key_def_new(part_def, part_count, for_func_index ?
+					  KEY_DEF_FOR_FUNC_INDEX : 0);
 	fail_if(def == NULL);
 	key_def_update_optionality(def, 0);
 
