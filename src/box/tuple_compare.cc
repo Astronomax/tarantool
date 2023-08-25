@@ -2123,8 +2123,124 @@ key_def_set_hint_func(struct key_def *def)
 
 /* }}} tuple_hint */
 
-static void
-key_def_set_compare_func_fast(struct key_def *def)
+namespace /* local symbols */ {
+struct Comparator {
+	tuple_compare_t tuple_compare;
+	tuple_compare_with_key_t tuple_compare_with_key;
+};
+
+template<bool ...flags>
+struct ComparatorSlow {
+	constexpr static Comparator value = {
+		tuple_compare_slowpath<flags...>,
+		tuple_compare_with_key_slowpath<flags...>
+	};
+};
+
+template<bool ...flags>
+struct ComparatorSeq {
+	constexpr static Comparator value = {
+		tuple_compare_sequential<flags...>,
+		tuple_compare_with_key_sequential<flags...>
+	};
+};
+
+template<bool ...flags>
+struct ComparatorFunc {
+	constexpr static Comparator value = {
+		func_index_compare<flags...>,
+		func_index_compare_with_key<flags...>
+	};
+};
+
+template<int i, typename FLAG>
+size_t
+comparator_get_index(FLAG flag)
+{
+	static_assert(i == 0, "i should be flag count minus one.");
+	return flag;
+}
+
+template<int i, typename FLAG, typename ...FLAGS>
+size_t
+comparator_get_index(FLAG flag, FLAGS... flags)
+{
+	const size_t flag_count = sizeof...(FLAGS) + 1;
+	static_assert(i == flag_count - 1, "i should be flag count minus one.");
+	return flag * (1 << i) + comparator_get_index<i - 1>(flags...);
+}
+
+/*
+ * Recursively generates combinations of flags to pass to comparator templates.
+ */
+template<template<bool ...> class Cmp, int I, bool ...flags>
+struct FillComparators {
+	template<size_t LEN>
+	static void
+	fill(Comparator(&table)[LEN])
+	{
+		FillComparators<Cmp, I - 1, flags..., false>::fill(table);
+		FillComparators<Cmp, I - 1, flags..., true>::fill(table);
+	}
+};
+
+template<template<bool ...> class Cmp, bool ...flags>
+struct FillComparators<Cmp, 0, flags...>
+{
+	/*
+	 * Puts the comprator template instantiation with the given arguments to
+	 * the comparator table. The index to put the comparator in is computed
+	 * based on the comparator template parameters.
+	 */
+	template<size_t LEN>
+	static void
+	fill(Comparator(&table)[LEN])
+	{
+		const int flag_count = sizeof...(flags);
+		static_assert(LEN == (1 << flag_count), "Flag set isn't full.");
+		const size_t i = comparator_get_index<flag_count - 1>(flags...);
+		assert(i < LEN);
+		table[i] = Cmp<flags...>::value;
+	}
+};
+
+enum comparator_argc {
+	COMPARATOR_SLOW_ARGC = 5,
+	COMPARATOR_SEQ_ARGC = 3,
+	COMPARATOR_FUNC_ARGC = 2,
+};
+
+template<template<bool ...> class Cmp, enum comparator_argc N>
+struct Comparators {
+	Comparator table[1 << static_cast<size_t>(N)];
+
+	Comparators()
+	{
+		FillComparators<Cmp, static_cast<int>(N)>::fill(table);
+	}
+
+	template<typename ...FLAGS>
+	Comparator
+	get(FLAGS... flags)
+	{
+		const int flag_count = sizeof...(FLAGS);
+		static_assert(flag_count == N, "Wrong flag count is provided.");
+		size_t i = comparator_get_index<flag_count - 1>(flags...);
+		assert(i < lengthof(table));
+		return table[i];
+	}
+};
+
+/*
+ * The comparators are filled at Tarantool statrup (in constructors).
+ */
+Comparators<ComparatorSlow, COMPARATOR_SLOW_ARGC> comparators_slow;
+Comparators<ComparatorSeq, COMPARATOR_SEQ_ARGC> comparators_seq;
+Comparators<ComparatorFunc, COMPARATOR_FUNC_ARGC> comparators_func;
+} /* end of anonymous namespace */
+
+static Comparator
+key_def_get_compare_func_fast(struct key_def *def)
 {
 	assert(!def->is_nullable);
 	assert(!def->has_optional_parts);
@@ -2176,140 +2292,32 @@ key_def_set_compare_func_fast(struct key_def *def)
 							false, false>;
 	}
 
-	def->tuple_compare = cmp;
-	def->tuple_compare_with_key = cmp_wk;
-}
-
-template<bool is_nullable, bool has_optional_parts>
-static void
-key_def_set_compare_func_plain(struct key_def *def)
-{
-	assert(!def->has_json_paths);
-	if (key_def_is_sequential(def)) {
-		if (key_def_has_desc_parts(def)) {
-			def->tuple_compare = tuple_compare_sequential
-				<is_nullable, has_optional_parts, true>;
-			def->tuple_compare_with_key =
-				tuple_compare_with_key_sequential
-				<is_nullable, has_optional_parts, true>;
-		} else {
-			def->tuple_compare = tuple_compare_sequential
-				<is_nullable, has_optional_parts, false>;
-			def->tuple_compare_with_key =
-				tuple_compare_with_key_sequential
-				<is_nullable, has_optional_parts, false>;
-		}
-	} else {
-		if (key_def_has_desc_parts(def)) {
-			def->tuple_compare = tuple_compare_slowpath
-				<is_nullable, has_optional_parts,
-				 false, false, true>;
-			def->tuple_compare_with_key =
-				tuple_compare_with_key_slowpath
-				<is_nullable, has_optional_parts,
-				 false, false, true>;
-		} else {
-			def->tuple_compare = tuple_compare_slowpath
-				<is_nullable, has_optional_parts,
-				 false, false, false>;
-			def->tuple_compare_with_key =
-				tuple_compare_with_key_slowpath
-				<is_nullable, has_optional_parts,
-				 false, false, false>;
-		}
-	}
-}
-
-template<bool is_nullable, bool has_optional_parts>
-static void
-key_def_set_compare_func_json(struct key_def *def)
-{
-	assert(def->has_json_paths);
-	if (def->is_multikey) {
-		if (key_def_has_desc_parts(def)) {
-			def->tuple_compare = tuple_compare_slowpath
-				<is_nullable, has_optional_parts,
-				 true, true, true>;
-			def->tuple_compare_with_key =
-				tuple_compare_with_key_slowpath
-				<is_nullable, has_optional_parts,
-				 true, true, true>;
-		} else {
-			def->tuple_compare = tuple_compare_slowpath
-				<is_nullable, has_optional_parts,
-				 true, true, false>;
-			def->tuple_compare_with_key =
-				tuple_compare_with_key_slowpath
-				<is_nullable, has_optional_parts,
-				 true, true, false>;
-		}
-	} else {
-		if (key_def_has_desc_parts(def)) {
-			def->tuple_compare = tuple_compare_slowpath
-				<is_nullable, has_optional_parts,
-				 true, false, true>;
-			def->tuple_compare_with_key =
-				tuple_compare_with_key_slowpath
-				<is_nullable, has_optional_parts,
-				 true, false, true>;
-		} else {
-			def->tuple_compare = tuple_compare_slowpath
-				<is_nullable, has_optional_parts,
-				 true, false, false>;
-			def->tuple_compare_with_key =
-				tuple_compare_with_key_slowpath
-				<is_nullable, has_optional_parts,
-				 true, false, false>;
-		}
-	}
-}
-
-template<bool is_nullable>
-static void
-key_def_set_compare_func_for_func_index(struct key_def *def)
-{
-	assert(def->for_func_index);
-	if (key_def_has_desc_parts(def)) {
-		def->tuple_compare = func_index_compare<is_nullable, true>;
-		def->tuple_compare_with_key =
-			func_index_compare_with_key<is_nullable, true>;
-	} else {
-		def->tuple_compare = func_index_compare<is_nullable, false>;
-		def->tuple_compare_with_key =
-			func_index_compare_with_key<is_nullable, false>;
-	}
+	return {cmp, cmp_wk};
 }
 
 void
 key_def_set_compare_func(struct key_def *def)
 {
+	Comparator c;
 	if (def->for_func_index) {
-		if (def->is_nullable)
-			key_def_set_compare_func_for_func_index<true>(def);
-		else
-			key_def_set_compare_func_for_func_index<false>(def);
+		c = comparators_func.get(def->is_nullable,
+					 key_def_has_desc_parts(def));
 	} else if (!def->is_nullable && !def->has_json_paths &&
 	    !key_def_has_collation(def) && !key_def_has_desc_parts(def)) {
-		key_def_set_compare_func_fast(def);
-	} else if (!def->has_json_paths) {
-		if (def->is_nullable && def->has_optional_parts) {
-			key_def_set_compare_func_plain<true, true>(def);
-		} else if (def->is_nullable && !def->has_optional_parts) {
-			key_def_set_compare_func_plain<true, false>(def);
-		} else {
-			assert(!def->is_nullable && !def->has_optional_parts);
-			key_def_set_compare_func_plain<false, false>(def);
-		}
+		c = key_def_get_compare_func_fast(def);
+	} else if (key_def_is_sequential(def)) {
+		c = comparators_seq.get(def->is_nullable,
+					def->has_optional_parts,
+					key_def_has_desc_parts(def));
 	} else {
-		if (def->is_nullable && def->has_optional_parts) {
-			key_def_set_compare_func_json<true, true>(def);
-		} else if (def->is_nullable && !def->has_optional_parts) {
-			key_def_set_compare_func_json<true, false>(def);
-		} else {
-			assert(!def->is_nullable && !def->has_optional_parts);
-			key_def_set_compare_func_json<false, false>(def);
-		}
+		c = comparators_slow.get(def->is_nullable,
+					 def->has_optional_parts,
+					 def->has_json_paths,
+					 def->is_multikey,
+					 key_def_has_desc_parts(def));
 	}
+	def->tuple_compare = c.tuple_compare;
+	def->tuple_compare_with_key = c.tuple_compare_with_key;
 	/*
 	 * We are setting compare functions to NULL in case the key_def
 	 * contains non-comparable type. Thus in case we later discover

@@ -1,3 +1,5 @@
+set(CMAKE_CXX_STANDARD 17)
+
 file(MAKE_DIRECTORY ${PROJECT_BINARY_DIR}/src/box/lua)
 file(MAKE_DIRECTORY ${PROJECT_BINARY_DIR}/src/box/sql)
 
