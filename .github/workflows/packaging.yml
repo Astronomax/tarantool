@@ -5,6 +5,7 @@ on:
     branches:
       - 'master'
       - 'release/**'
+      - 'ylobankov/add-testing-for-static-build-packaging'
     tags:
       - '**'
   pull_request:
