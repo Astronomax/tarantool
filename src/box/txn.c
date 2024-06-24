@@ -733,6 +733,9 @@ txn_complete_fail(struct txn *txn)
 	assert(in_txn() == txn);
 	if (txn->limbo_entry != NULL) {
 		assert(txn_has_flag(txn, TXN_WAIT_SYNC));
+		for (int i = 0; i < VCLOCK_MAX; i++)
+			if (txn_limbo.confirmed[i] == &txn->limbo_entry->in_queue)
+				txn_limbo.confirmed[i] = txn_limbo.confirmed[i]->prev;
 		txn_limbo_abort(&txn_limbo, txn->limbo_entry);
 		txn->limbo_entry = NULL;
 	}

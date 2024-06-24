@@ -184,12 +184,6 @@ txn_limbo_remove(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
 {
 	assert(!rlist_empty(&entry->in_queue));
 	assert(txn_limbo_first_entry(limbo) == entry);
-	for (int i = 0; i < VCLOCK_MAX; i++) {
-		if (limbo->confirmed[i] == &entry->in_queue) {
-			assert(limbo->confirmed[i]->prev == &limbo->queue);
-			limbo->confirmed[i] = limbo->confirmed[i]->prev;
-		}
-	}
 	rlist_del_entry(entry, in_queue);
 	limbo->len--;
 }
@@ -201,9 +195,6 @@ txn_limbo_pop(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
 	assert(txn_limbo_last_entry(limbo) == entry);
 	assert(entry->is_rollback);
 
-	for (int i = 0; i < VCLOCK_MAX; i++)
-		if (limbo->confirmed[i] == &entry->in_queue)
-			limbo->confirmed[i] = limbo->confirmed[i]->prev;
 	rlist_del_entry(entry, in_queue);
 	limbo->len--;
 	++limbo->rollback_count;
@@ -331,6 +322,17 @@ txn_limbo_wait_complete(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
 	}
 
 	txn_limbo_write_rollback(limbo, entry->lsn);
+
+	for (int i = 0; i < VCLOCK_MAX; i++) {
+		if (limbo->confirmed[i] == &limbo->queue)
+			continue;
+		int64_t confirmed_lsn =
+			rlist_entry(limbo->confirmed[i],
+				    struct txn_limbo_entry, in_queue)->lsn;
+		if (entry->lsn <= confirmed_lsn)
+			txn_limbo.confirmed[i] = entry->in_queue.prev;
+	}
+
 	struct txn_limbo_entry *e, *tmp;
 	rlist_foreach_entry_safe_reverse(e, &limbo->queue,
 					 in_queue, tmp) {
@@ -455,12 +457,30 @@ txn_limbo_write_confirm(struct txn_limbo *limbo, int64_t lsn)
 	txn_limbo_write_synchro(limbo, IPROTO_RAFT_CONFIRM, lsn, 0, NULL);
 }
 
+void
+txn_limbo_update_confirmed_on_confirm(struct txn_limbo *limbo, int64_t lsn)
+{
+	for (int i = 0; i < VCLOCK_MAX; i++) {
+		if (limbo->confirmed[i] == &limbo->queue)
+			continue;
+		int64_t confirmed_lsn = rlist_entry(limbo->confirmed[i],
+						    struct txn_limbo_entry, in_queue)->lsn;
+		assert(confirmed_lsn != -1);
+		if (lsn >= confirmed_lsn)
+			limbo->confirmed[i] = &limbo->queue;
+	}
+}
+
 /** Confirm all the entries <= @a lsn. */
 static void
 txn_limbo_read_confirm(struct txn_limbo *limbo, int64_t lsn)
 {
 	assert(limbo->owner_id != REPLICA_ID_NIL || txn_limbo_is_empty(limbo));
 	assert(limbo == &txn_limbo);
+	assert(lsn != -1);
+
+	txn_limbo_update_confirmed_on_confirm(limbo, lsn);
+
 	struct txn_limbo_entry *e, *tmp;
 	rlist_foreach_entry_safe(e, &limbo->queue, in_queue, tmp) {
 		/*
@@ -547,6 +567,20 @@ txn_limbo_write_rollback(struct txn_limbo *limbo, int64_t lsn)
 	limbo->is_in_rollback = false;
 }
 
+void
+txn_limbo_update_confirmed_on_rollback(struct txn_limbo *limbo, struct txn_limbo_entry *last_rollback)
+{
+	for (int i = 0; i < VCLOCK_MAX; i++) {
+		if (limbo->confirmed[i] == &limbo->queue)
+			continue;
+		int64_t confirmed_lsn =
+			rlist_entry(limbo->confirmed[i],
+				    struct txn_limbo_entry, in_queue)->lsn;
+		if (last_rollback->lsn <= confirmed_lsn)
+			txn_limbo.confirmed[i] = last_rollback->in_queue.prev;
+	}
+}
+
 /** Rollback all the entries >= @a lsn. */
 static void
 txn_limbo_read_rollback(struct txn_limbo *limbo, int64_t lsn)
@@ -564,6 +598,7 @@ txn_limbo_read_rollback(struct txn_limbo *limbo, int64_t lsn)
 	}
 	if (last_rollback == NULL)
 		return;
+	txn_limbo_update_confirmed_on_rollback(limbo, last_rollback);
 	rlist_foreach_entry_safe_reverse(e, &limbo->queue, in_queue, tmp) {
 		txn_limbo_abort(limbo, e);
 		txn_clear_flags(e->txn, TXN_WAIT_ACK);
@@ -720,6 +755,8 @@ txn_limbo_ack(struct txn_limbo *limbo, uint32_t replica_id, int64_t lsn)
 	limbo->confirmed[replica_id] = e->in_queue.prev;
 	if (confirm_lsn == -1 || confirm_lsn <= limbo->confirmed_lsn)
 		return;
+	for (int i = 0; i < VCLOCK_MAX; i++)
+		limbo->confirmed[i] = e->in_queue.prev;
 	txn_limbo_write_confirm(limbo, confirm_lsn);
 	txn_limbo_read_confirm(limbo, confirm_lsn);
 }
