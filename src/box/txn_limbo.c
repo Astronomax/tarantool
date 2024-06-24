@@ -53,6 +53,8 @@ txn_limbo_create(struct txn_limbo *limbo)
 	limbo->promote_greatest_term = 0;
 	latch_create(&limbo->promote_latch);
 	limbo->confirmed_lsn = 0;
+	for(int i = 0; i < VCLOCK_MAX; i++)
+		limbo->confirmed[i] = &limbo->queue;
 	limbo->rollback_count = 0;
 	limbo->is_in_rollback = false;
 	limbo->svp_confirmed_lsn = -1;
@@ -182,6 +184,12 @@ txn_limbo_remove(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
 {
 	assert(!rlist_empty(&entry->in_queue));
 	assert(txn_limbo_first_entry(limbo) == entry);
+	for (int i = 0; i < VCLOCK_MAX; i++) {
+		if (limbo->confirmed[i] == &entry->in_queue) {
+			assert(limbo->confirmed[i]->prev == &limbo->queue);
+			limbo->confirmed[i] = limbo->confirmed[i]->prev;
+		}
+	}
 	rlist_del_entry(entry, in_queue);
 	limbo->len--;
 }
@@ -193,6 +201,9 @@ txn_limbo_pop(struct txn_limbo *limbo, struct txn_limbo_entry *entry)
 	assert(txn_limbo_last_entry(limbo) == entry);
 	assert(entry->is_rollback);
 
+	for (int i = 0; i < VCLOCK_MAX; i++)
+		if (limbo->confirmed[i] == &entry->in_queue)
+			limbo->confirmed[i] = limbo->confirmed[i]->prev;
 	rlist_del_entry(entry, in_queue);
 	limbo->len--;
 	++limbo->rollback_count;
@@ -681,11 +692,15 @@ txn_limbo_ack(struct txn_limbo *limbo, uint32_t replica_id, int64_t lsn)
 	if (lsn == prev_lsn)
 		return;
 	vclock_follow(&limbo->vclock, replica_id, lsn);
-	struct txn_limbo_entry *e;
+	if (limbo->confirmed[replica_id]->next == &limbo->queue)
+		return;
+	struct txn_limbo_entry *e =
+		rlist_entry(limbo->confirmed[replica_id]->next,
+			    struct txn_limbo_entry, in_queue);
 	int64_t confirm_lsn = -1;
-	rlist_foreach_entry(e, &limbo->queue, in_queue) {
+	for (; !rlist_entry_is_head(e, &limbo->queue, in_queue); e = rlist_next_entry(e, in_queue)) {
 		assert(e->ack_count <= VCLOCK_MAX);
-		if (e->lsn > lsn)
+		if (e->lsn > lsn || e->lsn == -1)
 			break;
 		/*
 		 * Sync transactions need to collect acks. Async
@@ -702,6 +717,7 @@ txn_limbo_ack(struct txn_limbo *limbo, uint32_t replica_id, int64_t lsn)
 			confirm_lsn = e->lsn;
 		}
 	}
+	limbo->confirmed[replica_id] = e->in_queue.prev;
 	if (confirm_lsn == -1 || confirm_lsn <= limbo->confirmed_lsn)
 		return;
 	txn_limbo_write_confirm(limbo, confirm_lsn);

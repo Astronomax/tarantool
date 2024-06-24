@@ -169,6 +169,11 @@ struct txn_limbo {
 	 */
 	int64_t confirmed_lsn;
 	/**
+	 * A pointer to the list node corresponding to the last confirmed entry
+	 * for each replica.
+	 */
+	struct rlist *confirmed[VCLOCK_MAX];
+	/**
 	 * Total number of performed rollbacks. It used as a guard
 	 * to do some actions assuming all limbo transactions will
 	 * be confirmed, and to check that there were no rollbacks
