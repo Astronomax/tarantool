@@ -734,6 +734,8 @@ txn_complete_fail(struct txn *txn)
 	if (txn->limbo_entry != NULL) {
 		assert(txn_has_flag(txn, TXN_WAIT_SYNC));
 		txn_limbo_abort(&txn_limbo, txn->limbo_entry);
+		txn_limbo_update_confirmed_node_on_rollback(
+			&txn_limbo, txn->limbo_entry->lsn);
 		txn->limbo_entry = NULL;
 	}
 	txn->status = TXN_ABORTED;
