@@ -733,6 +733,7 @@ txn_complete_fail(struct txn *txn)
 	assert(in_txn() == txn);
 	if (txn->limbo_entry != NULL) {
 		assert(txn_has_flag(txn, TXN_WAIT_SYNC));
+		txn_limbo_on_rollback(&txn_limbo, txn->limbo_entry);
 		txn_limbo_abort(&txn_limbo, txn->limbo_entry);
 		txn->limbo_entry = NULL;
 	}

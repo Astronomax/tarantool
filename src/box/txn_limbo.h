@@ -58,11 +58,6 @@ struct txn_limbo_entry {
 	 */
 	int64_t lsn;
 	/**
-	 * Number of ACKs. Or in other words - how many replicas
-	 * confirmed receipt of the transaction.
-	 */
-	int ack_count;
-	/**
 	 * Result flags. Only one of them can be true. But both
 	 * can be false if the transaction is still waiting for
 	 * its resolution.
@@ -168,6 +163,12 @@ struct txn_limbo {
 	 * illegal.
 	 */
 	int64_t confirmed_lsn;
+
+	struct rlist *confirmed_node;
+
+	bool confirmed_node_valid;
+	
+	int ack_count;
 	/**
 	 * Total number of performed rollbacks. It used as a guard
 	 * to do some actions assuming all limbo transactions will
@@ -295,6 +296,9 @@ txn_limbo_replica_confirmed_lsn(const struct txn_limbo *limbo,
  */
 struct txn_limbo_entry *
 txn_limbo_last_synchro_entry(struct txn_limbo *limbo);
+
+void
+txn_limbo_on_rollback(struct txn_limbo *limbo, struct txn_limbo_entry *entry);
 
 /**
  * Allocate, create, and append a new transaction to the limbo.
