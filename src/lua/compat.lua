@@ -147,6 +147,13 @@ back to the user-provided 'is_sync' space option.
 https://tarantool.io/compat/box_consider_system_spaces_synchronous
 ]]
 
+local REPLICATION_SYNCHRO_TIMEOUT_DEPRECATION_BRIEF = [[
+Sets the default value for box.cfg.replication_synchro_timeout.
+Old is 5 seconds, new is infinity.
+
+https://tarantool.io/compat/box_cfg_replication_synchro_timeout
+]]
+
 -- Returns an action callback that toggles a tweak.
 local function tweak_action(tweak_name, old_tweak_value, new_tweak_value)
     return function(is_new)
@@ -270,6 +277,13 @@ local options = {
             box_consider_system_spaces_synchronous_tweak_action(is_new)
             ffi.C.system_spaces_update_is_sync_state_from_compat()
       end
+    },
+    replication_synchro_timeout_deprecation = {
+        default = 'old',
+        obsolete = nil,
+        brief = REPLICATION_SYNCHRO_TIMEOUT_DEPRECATION_BRIEF,
+        action = tweak_action(
+            'replication_synchro_timeout_enabled', true, false),
     },
 }
 

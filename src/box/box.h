@@ -376,6 +376,7 @@ void box_set_replication_sync_lag(void);
 void box_update_replication_synchro_quorum(void);
 int box_set_replication_synchro_quorum(void);
 int box_set_replication_synchro_timeout(void);
+int box_set_replication_new_option_name(void);
 void box_set_replication_sync_timeout(void);
 void box_set_replication_skip_conflict(void);
 void box_set_replication_anon(void);

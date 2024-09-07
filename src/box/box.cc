@@ -1479,6 +1479,19 @@ box_check_replication_synchro_timeout(void)
 }
 
 static double
+box_check_replication_new_option_name(void)
+{
+	double timeout = cfg_getd("replication_new_option_name");
+	if (timeout <= 0) {
+		diag_set(ClientError, ER_CFG,
+			 "replication_new_option_name",
+			 "the value must be greater than zero");
+		return -1;
+	}
+	return timeout;
+}
+
+static double
 box_check_replication_sync_timeout(void)
 {
 	double timeout = cfg_getd("replication_sync_timeout");
@@ -1975,6 +1988,8 @@ box_check_config(void)
 		diag_raise();
 	if (box_check_replication_synchro_timeout() < 0)
 		diag_raise();
+	if (box_check_replication_new_option_name() < 0)
+		diag_raise();
 	if (box_check_replication_threads() < 0)
 		diag_raise();
 	box_check_replication_sync_timeout();
@@ -2278,6 +2293,17 @@ box_set_replication_synchro_timeout(void)
 	if (value < 0)
 		return -1;
 	replication_synchro_timeout = value;
+	txn_limbo_on_parameters_change(&txn_limbo);
+	return 0;
+}
+
+int
+box_set_replication_new_option_name(void)
+{
+	double value = box_check_replication_new_option_name();
+	if (value < 0)
+		return -1;
+	replication_new_option_name = value;
 	txn_limbo_on_parameters_change(&txn_limbo);
 	return 0;
 }
@@ -3077,7 +3103,8 @@ box_promote(void)
 		return 0;
 	switch (box_election_mode) {
 	case ELECTION_MODE_OFF:
-		if (box_try_wait_confirm(2 * replication_synchro_timeout) != 0)
+		if (box_try_wait_confirm(
+			2 * replication_synchro_wait_confirm_timeout()) != 0)
 			return -1;
 		if (box_trigger_elections() != 0)
 			return -1;
@@ -3097,7 +3124,8 @@ box_promote(void)
 		unreachable();
 	}
 
-	int64_t wait_lsn = box_wait_limbo_acked(replication_synchro_timeout);
+	int64_t wait_lsn = box_wait_limbo_acked(
+		replication_synchro_wait_confirm_timeout());
 	if (wait_lsn < 0)
 		return -1;
 
@@ -3149,9 +3177,11 @@ box_demote(void)
 		return 0;
 	if (box_trigger_elections() != 0)
 		return -1;
-	if (box_try_wait_confirm(2 * replication_synchro_timeout) < 0)
+	if (box_try_wait_confirm(
+		2 * replication_synchro_wait_confirm_timeout()) < 0)
 		return -1;
-	int64_t wait_lsn = box_wait_limbo_acked(replication_synchro_timeout);
+	int64_t wait_lsn = box_wait_limbo_acked(
+		replication_synchro_wait_confirm_timeout());
 	if (wait_lsn < 0)
 		return -1;
 	return box_issue_demote(wait_lsn);
@@ -5631,6 +5661,8 @@ box_cfg_xc(void)
 	if (box_set_replication_synchro_quorum() != 0)
 		diag_raise();
 	if (box_set_replication_synchro_timeout() != 0)
+		diag_raise();
+	if (box_set_replication_new_option_name() != 0)
 		diag_raise();
 	if (box_set_replication_synchro_queue_max_size() != 0)
 		diag_raise();

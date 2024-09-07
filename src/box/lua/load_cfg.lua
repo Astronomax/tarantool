@@ -8,6 +8,7 @@ local math = require('math')
 local fiber = require('fiber')
 local fio = require('fio')
 local compat = require('compat')
+local tweaks = require('internal.tweaks')
 
 local function nop() end
 
@@ -186,6 +187,7 @@ local default_cfg = {
     replication_sync_timeout = 0,
     replication_synchro_quorum = "N / 2 + 1",
     replication_synchro_timeout = 5,
+    replication_new_option_name = 5,
     replication_synchro_queue_max_size = 16 * 1024 * 1024,
     replication_connect_timeout = 30,
     replication_connect_quorum = nil, -- connect all
@@ -388,6 +390,7 @@ local template_cfg = {
     replication_sync_timeout = 'number',
     replication_synchro_quorum = 'string, number',
     replication_synchro_timeout = 'number',
+    replication_new_option_name = 'number',
     replication_synchro_queue_max_size = 'number',
     replication_connect_timeout = 'number',
     replication_connect_quorum = 'number',
@@ -521,7 +524,17 @@ local dynamic_cfg = {
     replication_sync_lag    = private.cfg_set_replication_sync_lag,
     replication_sync_timeout = private.cfg_set_replication_sync_timeout,
     replication_synchro_quorum = private.cfg_set_replication_synchro_quorum,
-    replication_synchro_timeout = private.cfg_set_replication_synchro_timeout,
+    replication_synchro_timeout = function()
+        if compat.box_cfg_replication_synchro_timeout:is_old() then
+            log.warn("Option replication_synchro_timeout is deprecated.")
+        else
+            box.error(box.error.DEPRECATED,
+                "Option replication_synchro_timeout")
+        end
+        private.cfg_set_replication_synchro_timeout()
+    end,
+    replication_new_option_name =
+        private.cfg_set_replication_new_option_name,
     replication_synchro_queue_max_size =
         private.cfg_set_replication_synchro_queue_max_size,
     replication_skip_conflict = private.cfg_set_replication_skip_conflict,
@@ -640,6 +653,7 @@ local dynamic_cfg_order = {
     replication_sync_timeout    = 150,
     replication_synchro_quorum  = 150,
     replication_synchro_timeout = 150,
+    replication_new_option_name = 150,
     replication_synchro_queue_max_size = 150,
     replication_connect_timeout = 150,
     replication_connect_quorum  = 150,
@@ -688,6 +702,7 @@ local dynamic_cfg_skip_at_load = {
     replication_sync_timeout = true,
     replication_synchro_quorum = true,
     replication_synchro_timeout = true,
+    replication_new_option_name = true,
     replication_synchro_queue_max_size = true,
     replication_skip_conflict = true,
     replication_anon        = true,
