@@ -5,6 +5,7 @@ local NEW = true
 local OLD = false
 
 local ffi = require('ffi')
+local fun = require('fun')
 local tweaks = require('internal.tweaks')
 
 ffi.cdef[[
@@ -22,6 +23,7 @@ local options_format = {
     obsolete       = 'string/nil',
     run_action_now = 'boolean/nil',
     action         = 'function/nil',
+    dependencies   = 'table/nil'
 }
 
 local JSON_ESCAPE_BRIEF = [[
@@ -303,6 +305,17 @@ local options = {
     },
 }
 
+local function update_dependents(name)
+    local option = options[name]
+    -- Update .dependents for options that the current option depends on.
+    for _, dependency_name in ipairs(option.dependencies) do
+        local dependency = options[dependency_name]
+        if dependency ~= nil then
+            table.insert(dependency.dependents, name)
+        end
+    end
+end
+
 -- Array with option names in order of addition.
 local options_order = { }
 
@@ -320,8 +333,8 @@ Available commands:
     compat.dump()                   -- get Lua command that sets up different
                                        compat with same options as current
     compat.add_option()             -- add new option by providing a table with
-                                       name, default, brief, obsolete and action
-                                       function
+                                       name, default, brief, obsolete, action
+                                       function and dependencies
 ]]
 
 -- Returns table with all non-obsolete options from `options` and their values.
@@ -401,6 +414,7 @@ local function set_option(name, val)
     if not option then
         error(('Invalid option %s'):format(name))
     end
+    local val_string = val
     local selected
     if val == 'new' then
         val = NEW
@@ -418,6 +432,23 @@ local function set_option(name, val)
         error(('Chosen option %s is no longer available'):format(name))
     end
     if val ~= option.current then
+        -- Check that dependencies are satisfied.
+        -- An option cannot be switched to 'new' if some of its dependencies
+        -- are set to 'old'. And vise versa - an option cannot be switched to
+        -- 'old' if some of its dependents are set to 'new'.
+        local edges = (val == NEW) and
+            option.dependencies or option.dependents
+        for _, neighbour_name in ipairs(edges) do
+            local neighbour = options[neighbour_name]
+            -- All options on which the current depends must be added
+            assert(neighbour)
+            if neighbour.current ~= val then
+                error(("The compat option '%s' may be set to '%s' only " ..
+                    "when compat option '%s' is '%s'")
+                    :format(name, val_string, neighbour_name, val_string))
+            end
+        end
+
         option.action(val)
     end
     option.current = val
@@ -521,10 +552,12 @@ end
 -- * obsolete       (string/nil)
 -- * action         (function/nil)
 -- * run_action_now (boolean/nil)
+-- * dependencies   (array/nil)
 function compat.add_option(option_def)
     if type(option_def) ~= 'table' then
         error("usage: compat.add_option({name = '...', default = 'new'/'old'" ..
-              ", brief = '...', action = func, run_action_now = true/false})")
+              ", brief = '...', action = func, run_action_now = true/false, " ..
+              "dependencies = array/nil})")
     end
     local name = option_def.name
     verify_option(name, option_def)
@@ -545,10 +578,23 @@ function compat.add_option(option_def)
 
     -- Copy all other fields.
     local option = options[name]
-    option.brief    = option_def.brief
-    option.default  = option_def.default
-    option.obsolete = option_def.obsolete
-    option.action   = option_def.action
+    option.brief        = option_def.brief
+    option.default      = option_def.default
+    option.obsolete     = option_def.obsolete
+    option.action       = option_def.action
+    option.dependencies = option_def.dependencies or { }
+    option.dependents   = { }
+
+    -- Take into account in option.dependents options that
+    -- depend on the current option, but were added earlier.
+    for dependent_name, dependent in pairs(options) do
+        for _, dependency_name in ipairs(dependent.dependencies) do
+            if dependency_name == name then
+                table.insert(option.dependents, dependent_name)
+            end
+        end
+    end
+    update_dependents(name)
 
     if not option.obsolete and option_def.run_action_now then
         option.action(options[name].current)
@@ -560,11 +606,18 @@ function compat.help()
 end
 
 function compat.preload()
+    for _, option in pairs(options) do
+        if option.dependencies == nil then
+            option.dependencies = { }
+        end
+        option.dependents = { }
+    end
     for key, option in pairs(options) do
         verify_option(key, option)
         table.insert(options_order, key)
         option.current = option.default == 'new'
         option.selected = false
+        update_dependents(key)
     end
     -- Preload should be run only once and is removed not to confuse users.
     compat.preload = nil
@@ -583,12 +636,75 @@ end
 
 local compat_mt = { }
 
+local function topsorted(nodes_list, edges_list)
+    -- Incoming degrees of each node (node_name -> 0 initially)
+    local indegree = fun.zip(nodes_list, fun.zeros()):tomap()
+    for _, from in ipairs(nodes_list) do
+        local edges = edges_list[from] or { }
+        for _, to in ipairs(edges) do
+            if indegree[to] ~= nil then
+                indegree[to] = indegree[to] + 1
+            end
+        end
+    end
+    local topsort = fun.filter(function(node)
+        return indegree[node] == 0 end, nodes_list):totable()
+    local i = 1
+    while i <= #topsort do
+        local edges = edges_list[topsort[i]] or { }
+        for _, node in ipairs(edges) do
+            -- node is not contained in nodes_list - skip
+            if indegree[node] ~= nil then
+                indegree[node] = indegree[node] - 1
+                if indegree[node] == 0 then
+                    table.insert(topsort, node)
+                end
+            end
+        end
+        i = i + 1
+    end
+    assert(#topsort == #nodes_list, "circular dependencies detected")
+    return topsort
+end
+
 function compat_mt.__call(_, list)
     if type(list) ~= 'table' then
         error("usage: compat({<option_name> = 'new'/'old'/'default'})")
     end
-    for key, val in pairs(list) do
-        set_option(key, val)
+    -- Here we could do a precheck that all dependencies are satisfied, and if
+    -- not, then raise an error. And we could even allow dependency cycles.
+    -- Yes, this would be useless, because all the options on the cycle are
+    -- essentially one option (either all are set to 'old' or all are set to
+    -- 'new'). It seems that after such a check we could set the options in any
+    -- order. But there is an important problem here why we cannot do this.
+    -- It may happen that setting the current option will raise an error, and
+    -- then those options that we have already set by this moment will end up
+    -- with unsatisfied dependencies. Therefore, here we are required to set
+    -- options in topological sorting order, and therefore circular dependencies
+    -- are prohibited.
+    --
+    local new_list, old_list = fun.iter(list):partition(
+        function(key, value)
+            if value == 'default' then
+                return options[key].default == 'new'
+            end
+            return value == 'new'
+        end
+    )
+
+    -- 'new' must be set in topsort order by dependencies
+    local edges = new_list:map(function(key)
+        return key, options[key].dependents end):tomap()
+    local new_list = topsorted(new_list:totable(), edges)
+    for _, key in ipairs(new_list) do
+        set_option(key, list[key])
+    end
+    -- 'old' must be set in topsort order by dependents
+    edges = old_list:map(function(key)
+        return key, options[key].dependencies end):tomap()
+    old_list = topsorted(old_list:totable(), edges)
+    for _, key in ipairs(old_list) do
+        set_option(key, list[key])
     end
 end
 
@@ -635,6 +751,8 @@ function compat_mt.__index(_, key)
         brief = options[key].brief,
         default = options[key].default,
         obsolete = options[key].obsolete,
+        dependencies = options[key].dependencies,
+        dependents = options[key].dependents,
     }
 
     if not options[key].selected then
