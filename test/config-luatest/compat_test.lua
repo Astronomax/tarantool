@@ -21,6 +21,12 @@ local non_dynamic = {
     },
 }
 
+-- The order of checking is deterministic, so we can only check for one
+-- specific error - a conflict with the first dependency in
+-- dependencies list.
+local dependencies_error_fmt = "The compat option '%s' may be set to 'new' " ..
+    "only when compat option '%s' is 'new'"
+
 -- Ensure that all the options from the compat module are present
 -- in the compat sections of the instance config and vice versa.
 --
@@ -57,13 +63,47 @@ local function verify(cluster, option_name, exp)
     end, {option_name, exp})
 end
 
+local function gen_reload_config(option_name, v, ignore_dependencies)
+    local actual_value = v ~= 'default'
+        and v or compat[option_name].default
+
+    if not ignore_dependencies then
+        -- Build a valid config that satisfies all dependencies
+        local compat_config = { [option_name] = actual_value, }
+        local pending = { option_name, }
+        while #pending > 0 do
+            local option = compat[pending[1]]
+            -- 'new' value can only conflict with dependencies, and 'old' value
+            -- can only conflict with dependents (If an option is set to 'new',
+            -- all its dependencies must be set to 'new' and vise versa)
+            local dependencies = (actual_value == 'new') and
+                option.dependencies or option.dependents
+            for _, neighbour_name in ipairs(dependencies) do
+                if compat_config[neighbour_name] == nil then
+                    table.insert(pending, neighbour_name)
+                    compat_config[neighbour_name] = actual_value
+                end
+            end
+            table.remove(pending, 1)
+        end
+        return compat_config
+    else
+        return { [option_name] = v ~= 'default' and v or box.NULL, }
+    end
+end
+
+local function gen_startup_config(option_name, v, ignore_dependencies)
+    return fun.iter(gen_reload_config(option_name, v, ignore_dependencies))
+        :filter(function(_, v) return v ~= box.NULL end):tomap()
+end
+
 -- Write a new config file with the given compat option and reload
 -- the configuration.
-local function switch(cluster, option_name, startup_config, v)
+local function switch(cluster, option_name, startup_config, v,
+    ignore_dependencies)
     local config = cbuilder:new(startup_config)
-        :set_instance_option('instance-001', 'compat', {
-            [option_name] = v ~= 'default' and v or box.NULL,
-        })
+        :set_instance_option('instance-001', 'compat',
+            gen_reload_config(option_name, v, ignore_dependencies))
         :config()
     cluster:reload(config)
 end
@@ -73,11 +113,8 @@ end
 local function gen_startup_case(option_name, v)
     return function(g)
         local startup_config = cbuilder:new()
-            :add_instance('instance-001', {
-                compat = {
-                    [option_name] = v ~= 'default' and v or nil,
-                },
-            })
+            :add_instance('instance-001', { compat =
+                gen_startup_config(option_name, v), })
             :config()
 
         local cluster = cluster.new(g, startup_config)
@@ -113,24 +150,20 @@ end
 
 -- Verify that an attempt to change the option on reload leads to
 -- an error.
-local function gen_reload_failure_case(option_name, startup_value, reload_value)
+local function gen_reload_failure_case(option_name, startup_value, reload_value,
+    exp_err, ignore_dependencies)
     return function(g)
         local startup_config = cbuilder:new()
-            :add_instance('instance-001', {
-                compat = {
-                    [option_name] = startup_value ~= 'default' and
-                        startup_value or nil,
-                },
-            })
+            :add_instance('instance-001', { compat =
+                gen_startup_config(option_name, startup_value), })
             :config()
 
         local cluster = cluster.new(g, startup_config)
         cluster:start()
 
         -- Attempt to switch the option to another value.
-        local exp_err = non_dynamic[option_name].error
         t.assert_error_msg_content_equals(exp_err, switch, cluster,
-            option_name, startup_config, reload_value)
+            option_name, startup_config, reload_value, ignore_dependencies)
 
         -- Verify that the value remains the same.
         verify(cluster, option_name, startup_value)
@@ -179,12 +212,8 @@ end
 local function gen_reload_success_case(option_name, startup_value, reload_value)
     return function(g)
         local startup_config = cbuilder:new()
-            :add_instance('instance-001', {
-                compat = {
-                    [option_name] = startup_value ~= 'default' and
-                        startup_value or nil,
-                },
-            })
+            :add_instance('instance-001', { compat =
+                gen_startup_config(option_name, startup_value), })
             :config()
 
         local cluster = cluster.new(g, startup_config)
@@ -218,6 +247,18 @@ for option_name, _ in pairs(compat._options()) do
         g[case_name_prefix .. v] = gen_startup_case(option_name, v)
     end
 
+    -- An option with dependencies cannot be set to 'new' until all its
+    -- dependencies are set to new.
+    local dependencies = compat[option_name].dependencies
+    if #dependencies > 0 then
+        local case_name = ('test_reload_%s_failure_unsatisfied_dependencies')
+            :format(option_name)
+        local exp_err = dependencies_error_fmt
+            :format(option_name, dependencies[1])
+        g[case_name] = gen_reload_failure_case(
+            option_name, 'old', 'new', exp_err, true)
+    end
+
     if non_dynamic[option_name] == nil then
         -- Start without compat option and set it on reload.
         g['test_reload_' .. option_name] = gen_reload_case(option_name)
@@ -229,16 +270,17 @@ for option_name, _ in pairs(compat._options()) do
         -- used interchangeably and switching from one to another
         -- on reload doesn't trigger any error.
         local case_name_prefix = ('test_reload_%s_'):format(option_name)
+        local exp_err = non_dynamic[option_name].error
         g[case_name_prefix .. 'failure_old_to_new'] = gen_reload_failure_case(
-            option_name, 'old', 'new')
+            option_name, 'old', 'new', exp_err)
         g[case_name_prefix .. 'failure_new_to_old'] = gen_reload_failure_case(
-            option_name, 'new', 'old')
+            option_name, 'new', 'old', exp_err)
         local def = compat._options()[option_name].default
         if def == 'old' then
             g[case_name_prefix .. 'failure_default_to_new'] =
-                gen_reload_failure_case(option_name, 'default', 'new')
+                gen_reload_failure_case(option_name, 'default', 'new', exp_err)
             g[case_name_prefix .. 'failure_new_to_default'] =
-                gen_reload_failure_case(option_name, 'new', 'default')
+                gen_reload_failure_case(option_name, 'new', 'default', exp_err)
             g[case_name_prefix .. 'success_default_to_old'] =
                 gen_reload_success_case(option_name, 'default', 'old')
             g[case_name_prefix .. 'success_old_to_default'] =
@@ -249,9 +291,9 @@ for option_name, _ in pairs(compat._options()) do
             g[case_name_prefix .. 'success_new_to_default'] =
                 gen_reload_success_case(option_name, 'new', 'default')
             g[case_name_prefix .. 'failure_default_to_old'] =
-                gen_reload_failure_case(option_name, 'default', 'old')
+                gen_reload_failure_case(option_name, 'default', 'old', exp_err)
             g[case_name_prefix .. 'failure_old_to_default'] =
-                gen_reload_failure_case(option_name, 'old', 'default')
+                gen_reload_failure_case(option_name, 'old', 'default', exp_err)
         end
     end
 end

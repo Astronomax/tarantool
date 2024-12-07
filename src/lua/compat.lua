@@ -5,6 +5,7 @@ local NEW = true
 local OLD = false
 
 local ffi = require('ffi')
+local fun = require('fun')
 local tweaks = require('internal.tweaks')
 
 ffi.cdef[[
@@ -22,6 +23,7 @@ local options_format = {
     obsolete       = 'string/nil',
     run_action_now = 'boolean/nil',
     action         = 'function/nil',
+    dependencies   = 'table/nil'
 }
 
 local JSON_ESCAPE_BRIEF = [[
@@ -180,52 +182,63 @@ local box_consider_system_spaces_synchronous_tweak_action =
     tweak_action('box_consider_system_spaces_synchronous', false, true)
 
 -- Contains options descriptions in following format:
--- * default  (string)
--- * brief    (string)
--- * obsolete (string or nil)
--- * current  (boolean, true for 'new')
--- * selected (boolean)
--- * action   (function)
-local options = {
-    json_escape_forward_slash = {
+-- * default        (string)
+-- * brief          (string)
+-- * obsolete       (string or nil)
+-- * current        (boolean, true for 'new')
+-- * selected       (boolean)
+-- * action         (function)
+-- * dependencies   (array/nil)
+-- * dependents     (array/nil)
+local options = { }
+
+local option_defs = {
+    {
+        name = 'json_escape_forward_slash',
         default = 'new',
         obsolete = nil,
         brief = JSON_ESCAPE_BRIEF,
         run_action_now = true,
         action = tweak_action('json_escape_forward_slash', true, false),
     },
-    yaml_pretty_multiline = {
+    {
+        name = 'yaml_pretty_multiline',
         default = 'new',
         obsolete = nil,
         brief = YAML_PRETTY_MULTILINE_BRIEF,
         action = tweak_action('yaml_pretty_multiline', false, true),
     },
-    fiber_channel_close_mode = {
+    {
+        name = 'fiber_channel_close_mode',
         default = 'new',
         obsolete = nil,
         brief = FIBER_CHANNEL_GRACEFUL_CLOSE_BRIEF,
         action = tweak_action('fiber_channel_close_mode',
                               'forceful', 'graceful'),
     },
-    sql_priv = {
+    {
+        name = 'sql_priv',
         default = 'new',
         obsolete = nil,
         brief = SQL_PRIV_BRIEF,
         action = tweak_action('sql_access_check_is_enabled', false, true)
     },
-    sql_seq_scan_default = {
+    {
+        name = 'sql_seq_scan_default',
         default = 'new',
         obsolete = nil,
         brief = SQL_SEQ_SCAN_DEFAULT_BRIEF,
         action = tweak_action('sql_seq_scan_default', true, false),
     },
-    box_info_cluster_meaning = {
+    {
+        name = 'box_info_cluster_meaning',
         default = 'new',
         obsolete = nil,
         brief = BOX_INFO_CLUSTER_MEANING_BRIEF,
         action = tweak_action('box_info_cluster_new_meaning', false, true),
     },
-    binary_data_decoding = {
+    {
+        name = 'binary_data_decoding',
         default = 'new',
         obsolete = nil,
         brief = BINARY_DATA_DECODING_BRIEF,
@@ -234,52 +247,60 @@ local options = {
             tweaks.msgpack_decode_binary_as_string = not is_new
         end,
     },
-    box_tuple_new_vararg = {
+    {
+        name = 'box_tuple_new_vararg',
         default = 'new',
         obsolete = nil,
         brief = BOX_TUPLE_NEW_VARARG_BRIEF,
         action = function() end,
     },
-    box_session_push_deprecation = {
+    {
+        name = 'box_session_push_deprecation',
         default = 'old',
         obsolete = nil,
         brief = BOX_SESSION_PUSH_DEPRECATION_BRIEF,
         run_action_now = true,
         action = tweak_action('box_session_push_is_disabled', false, true),
     },
-    c_func_iproto_multireturn = {
+    {
+        name = 'c_func_iproto_multireturn',
         default = 'new',
         obsolete = nil,
         brief = C_FUNC_IPROTO_MULTIRETURN_BRIEF,
         run_action_now = true,
         action = tweak_action('c_func_iproto_multireturn', false, true),
     },
-    box_tuple_extension = {
+    {
+        name = 'box_tuple_extension',
         default = 'new',
         obsolete = nil,
         brief = BOX_TUPLE_EXTENSION_BRIEF,
         run_action_now = true,
         action = tweak_action('box_tuple_extension', false, true)
     },
-    box_space_max = {
+    {
+        name = 'box_space_max',
         default = 'new',
         obsolete = nil,
         brief = BOX_SPACE_MAX_BRIEF,
         action = tweak_action('BOX_SPACE_MAX', 2147483647, 2147483646)
     },
-    box_error_unpack_type_and_code = {
+    {
+        name = 'box_error_unpack_type_and_code',
         default = 'old',
         obsolete = nil,
         brief = BOX_ERROR_UNPACK_TYPE_AND_CODE_BRIEF,
         action = function() end
     },
-    box_error_serialize_verbose = {
+    {
+        name = 'box_error_serialize_verbose',
         default = 'old',
         obsolete = nil,
         brief = BOX_ERROR_SERIALIZE_VERBOSE,
         action = function() end,
     },
-    box_consider_system_spaces_synchronous = {
+    {
+      name = 'box_consider_system_spaces_synchronous',
       default = 'old',
       obsolete = nil,
       brief = BOX_CONSIDER_SYSTEM_SPACES_SYNCHRONOUS,
@@ -288,13 +309,15 @@ local options = {
             ffi.C.system_spaces_update_is_sync_state_from_compat()
       end
     },
-    wal_cleanup_delay_deprecation = {
+    {
+        name = 'wal_cleanup_delay_deprecation',
         default = 'old',
         obsolete = nil,
         brief = WAL_CLEANUP_DELAY_DEPRECATION_BRIEF,
         action = function() end,
     },
-    replication_synchro_timeout = {
+    {
+        name = 'replication_synchro_timeout',
         default = 'old',
         obsolete = nil,
         brief = REPLICATION_SYNCHRO_TIMEOUT_COMPAT_BRIEF,
@@ -305,6 +328,8 @@ local options = {
 
 -- Array with option names in order of addition.
 local options_order = { }
+
+local options_order_pos = { }
 
 local help = [[
 Tarantool compatibility module.
@@ -320,8 +345,8 @@ Available commands:
     compat.dump()                   -- get Lua command that sets up different
                                        compat with same options as current
     compat.add_option()             -- add new option by providing a table with
-                                       name, default, brief, obsolete and action
-                                       function
+                                       name, default, brief, obsolete, action
+                                       function and dependencies
 ]]
 
 -- Returns table with all non-obsolete options from `options` and their values.
@@ -401,6 +426,7 @@ local function set_option(name, val)
     if not option then
         error(('Invalid option %s'):format(name))
     end
+    local val_string = val
     local selected
     if val == 'new' then
         val = NEW
@@ -418,6 +444,23 @@ local function set_option(name, val)
         error(('Chosen option %s is no longer available'):format(name))
     end
     if val ~= option.current then
+        -- Check that dependencies are satisfied.
+        -- An option cannot be switched to 'new' if some of its dependencies
+        -- are set to 'old'. And vise versa - an option cannot be switched to
+        -- 'old' if some of its dependents are set to 'new'.
+        local edges = (val == NEW) and
+            option.dependencies or option.dependents
+        for _, neighbour_name in ipairs(edges) do
+            local neighbour = options[neighbour_name]
+            -- All options on which the current depends must be added
+            assert(neighbour)
+            if neighbour.current ~= val then
+                error(("The compat option '%s' may be set to '%s' only " ..
+                    "when compat option '%s' is '%s'")
+                    :format(name, val_string, neighbour_name, val_string))
+            end
+        end
+
         option.action(val)
     end
     option.current = val
@@ -521,10 +564,12 @@ end
 -- * obsolete       (string/nil)
 -- * action         (function/nil)
 -- * run_action_now (boolean/nil)
+-- * dependencies   (array/nil)
 function compat.add_option(option_def)
     if type(option_def) ~= 'table' then
         error("usage: compat.add_option({name = '...', default = 'new'/'old'" ..
-              ", brief = '...', action = func, run_action_now = true/false})")
+              ", brief = '...', action = func, run_action_now = true/false, " ..
+              "dependencies = array/nil})")
     end
     local name = option_def.name
     verify_option(name, option_def)
@@ -537,6 +582,7 @@ function compat.add_option(option_def)
             selected = false
         }
         table.insert(options_order, name)
+        options_order_pos[name] = #options_order
     -- If hot reload but option is set to 'default', update `current`.
     elseif not options[name].selected then
         options[name].current = current
@@ -545,10 +591,18 @@ function compat.add_option(option_def)
 
     -- Copy all other fields.
     local option = options[name]
-    option.brief    = option_def.brief
-    option.default  = option_def.default
-    option.obsolete = option_def.obsolete
-    option.action   = option_def.action
+    option.brief        = option_def.brief
+    option.default      = option_def.default
+    option.obsolete     = option_def.obsolete
+    option.action       = option_def.action
+    option.dependencies = option_def.dependencies or { }
+    option.dependents   = { }
+
+    for _, dependency_name in ipairs(option.dependencies) do
+        local dependency = options[dependency_name]
+        assert(dependency)
+        table.insert(dependency.dependents, name)
+    end
 
     if not option.obsolete and option_def.run_action_now then
         option.action(options[name].current)
@@ -560,11 +614,8 @@ function compat.help()
 end
 
 function compat.preload()
-    for key, option in pairs(options) do
-        verify_option(key, option)
-        table.insert(options_order, key)
-        option.current = option.default == 'new'
-        option.selected = false
+    for _, option_def in ipairs(option_defs) do
+        compat.add_option(option_def)
     end
     -- Preload should be run only once and is removed not to confuse users.
     compat.preload = nil
@@ -587,8 +638,41 @@ function compat_mt.__call(_, list)
     if type(list) ~= 'table' then
         error("usage: compat({<option_name> = 'new'/'old'/'default'})")
     end
-    for key, val in pairs(list) do
-        set_option(key, val)
+    -- Here we could do a precheck that all dependencies are satisfied, and if
+    -- not, then raise an error. And we could even allow dependency cycles.
+    -- Yes, this would be useless, because all the options on the cycle are
+    -- essentially one option (either all are set to 'old' or all are set to
+    -- 'new'). It seems that after such a check we could set the options in any
+    -- order. But there is an important problem here why we cannot do this.
+    -- It may happen that setting the current option will raise an error, and
+    -- then those options that we have already set by this moment will end up
+    -- with unsatisfied dependencies. Therefore, here we are required to set
+    -- options in topological sorting order, and therefore circular dependencies
+    -- are prohibited.
+    --
+    local new_list, old_list = fun.iter(list):partition(
+        function(key, value)
+            if value == 'default' then
+                return options[key].default == 'new'
+            end
+            return value == 'new'
+        end
+    )
+    -- 'new' must be set in topsort order by dependencies
+    new_list = new_list:totable()
+    table.sort(new_list, function(a, b)
+        return options_order_pos[a] < options_order_pos[b]
+    end)
+    for _, key in ipairs(new_list) do
+        set_option(key, list[key])
+    end
+    -- 'old' must be set in topsort order by dependents
+    old_list = old_list:totable()
+    table.sort(old_list, function(a, b)
+        return options_order_pos[a] > options_order_pos[b]
+    end)
+    for _, key in ipairs(old_list) do
+        set_option(key, list[key])
     end
 end
 
@@ -635,6 +719,8 @@ function compat_mt.__index(_, key)
         brief = options[key].brief,
         default = options[key].default,
         obsolete = options[key].obsolete,
+        dependencies = options[key].dependencies,
+        dependents = options[key].dependents,
     }
 
     if not options[key].selected then
