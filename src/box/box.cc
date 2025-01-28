@@ -169,12 +169,6 @@ static bool is_storage_shutdown = false;
 static bool is_ro = true;
 static fiber_cond ro_cond;
 
-/**
- * The following flag is set if the instance failed to
- * synchronize to a sufficient number of replicas to form
- * a quorum and so was forced to switch to read-only mode.
- */
-static bool is_orphan;
 
 /**
  * Summary flag incorporating all the instance attributes,
@@ -347,6 +341,41 @@ title(const char *new_status)
 	box_broadcast_status();
 }
 
+/** RO modes sorted by priority */
+#define box_ro_MODE(_)				\
+	_(box_ro_none, 0)			\
+	_(box_ro_orphan, 1)			\
+	_(box_ro_waiting_for_own_rows, 2)	\
+
+ENUM(box_ro_mode, box_ro_MODE);
+STRS(box_ro_mode, box_ro_MODE);
+
+bool box_ro_mode_active[box_ro_mode_MAX];
+bool box_ro_mode_active_notified[box_ro_mode_MAX];
+
+/**
+ * The following flag is set if the instance failed to
+ * synchronize to a sufficient number of replicas to form
+ * a quorum and so was forced to switch to read-only mode.
+ */
+const bool &is_orphan = box_ro_mode_active[box_ro_orphan];
+
+/**
+ * The following flag is set if the instance is waiting for some
+ * of its own transactions that it lost to be replicated to it.
+ */
+const bool &is_waiting_for_own_rows =
+	box_ro_mode_active[box_ro_waiting_for_own_rows];
+
+box_ro_mode box_max_active_ro_mode = box_ro_none;
+box_ro_mode box_max_active_notified_ro_mode = box_ro_none;
+
+const char *
+box_ro_mode_to_string(box_ro_mode mode)
+{
+	return box_ro_mode_strs[mode] + strlen("box_ro_");
+}
+
 /**
  * Create a message describing the ro state and put it into a buffer.
  */
@@ -392,14 +421,16 @@ box_ro_state_msg(char *buf, int size)
 				SNPRINT(total, snprintf, buf, size,
 					" and is frozen until promotion");
 		}
+	} else if (is_ro) {
+		SNPRINT(total, snprintf, buf, size,
+			"box.cfg.read_only is true");
+	} else if (box_max_active_ro_mode > box_ro_none) {
+		const char *mode_str =
+			box_ro_mode_to_string(box_max_active_ro_mode);
+		SNPRINT(total, snprintf, buf, size,
+			"it is in %s mode", mode_str);
 	} else {
-		if (is_ro)
-			SNPRINT(total, snprintf, buf, size,
-				"box.cfg.read_only is true");
-		else if (is_orphan)
-			SNPRINT(total, snprintf, buf, size, "it is an orphan");
-		else
-			unreachable();
+		unreachable();
 	}
 	(void)total;
 	return 0;
@@ -409,8 +440,8 @@ void
 box_update_ro_summary(void)
 {
 	bool old_is_ro_summary = is_ro_summary;
-	is_ro_summary = is_ro || is_orphan || raft_is_ro(box_raft()) ||
-			txn_limbo_is_ro(&txn_limbo);
+	is_ro_summary = is_ro || (box_max_active_ro_mode > box_ro_none) ||
+			raft_is_ro(box_raft()) || txn_limbo_is_ro(&txn_limbo);
 	/* In 99% nothing changes. Filter this out first. */
 	if (is_ro_summary == old_is_ro_summary)
 		return;
@@ -436,6 +467,66 @@ box_update_ro_summary(void)
 	box_broadcast_ballot();
 }
 
+void
+box_do_set_ro_mode_active(box_ro_mode mode, bool active, bool notified)
+{
+	bool *active_flags = notified ?
+		box_ro_mode_active_notified : box_ro_mode_active;
+	box_ro_mode &max_active = notified ?
+		box_max_active_notified_ro_mode : box_max_active_ro_mode;
+
+	bool &is_active_now = active_flags[mode];
+	if (is_active_now == active)
+		return;
+
+	is_active_now = active;
+	if (is_active_now && mode > max_active) {
+		max_active = mode;
+	} else if (!is_active_now && mode == max_active) {
+		int max_active_actual = max_active;
+		for (; max_active_actual > box_ro_none; --max_active_actual)
+			if (active_flags[max_active_actual])
+				break;
+		max_active = (box_ro_mode)max_active_actual;
+	}
+}
+
+void
+box_set_ro_mode_active(box_ro_mode mode, bool active, bool notify)
+{
+	assert(mode != box_ro_none);
+	box_do_set_ro_mode_active(mode, active, false);
+	box_update_ro_summary();
+
+	if (box_max_active_ro_mode == box_ro_none)
+		title("running");
+
+	if (!notify)
+		return;
+
+	box_ro_mode prev_max_active_notified_ro_mode =
+		box_max_active_notified_ro_mode;
+	box_do_set_ro_mode_active(mode, active, true);
+
+	if (box_max_active_notified_ro_mode ==
+	    prev_max_active_notified_ro_mode)
+		return;
+
+	if (prev_max_active_notified_ro_mode != box_ro_none) {
+		const char *mode_str = box_ro_mode_to_string(
+			prev_max_active_notified_ro_mode);
+		say_info("leaving %s mode", mode_str);
+	}
+	if (box_max_active_ro_mode == box_ro_none) {
+		say_info("ready to accept requests");
+	} else {
+		const char *mode_str = box_ro_mode_to_string(
+			box_max_active_notified_ro_mode);
+		title(mode_str);
+		say_info("entering %s mode", mode_str);
+	}
+}
+
 API_EXPORT const char *
 box_ro_reason(void)
 {
@@ -445,8 +536,8 @@ box_ro_reason(void)
 		return "synchro";
 	if (is_ro)
 		return "config";
-	if (is_orphan)
-		return "orphan";
+	if (box_max_active_ro_mode > box_ro_none)
+		return box_ro_mode_to_string(box_max_active_ro_mode);
 	return NULL;
 }
 
@@ -592,6 +683,12 @@ box_is_ro(void)
 }
 
 bool
+box_is_waiting_for_own_rows(void)
+{
+	return is_waiting_for_own_rows;
+}
+
+bool
 box_is_orphan(void)
 {
 	return is_orphan;
@@ -615,10 +712,15 @@ box_wait_ro(bool ro, double timeout)
 }
 
 void
-box_do_set_orphan(bool orphan)
+box_set_waiting_for_own_rows(bool waiting_for_own_rows)
 {
-	is_orphan = orphan;
-	box_update_ro_summary();
+	box_set_ro_mode_active(
+		box_ro_waiting_for_own_rows, waiting_for_own_rows, true);
+}
+
+void
+box_check_recovery_state_synced_is_reached()
+{
 	if (!is_orphan && !recovery_state_synced_is_reached) {
 		box_run_on_recovery_state(RECOVERY_STATE_SYNCED);
 		recovery_state_synced_is_reached = true;
@@ -626,17 +728,17 @@ box_do_set_orphan(bool orphan)
 }
 
 void
+box_do_set_orphan(bool orphan)
+{
+	box_set_ro_mode_active(box_ro_orphan, orphan, false);
+	box_check_recovery_state_synced_is_reached();
+}
+
+void
 box_set_orphan(bool orphan)
 {
-	box_do_set_orphan(orphan);
-	/* Update the title to reflect the new status. */
-	if (is_orphan) {
-		say_info("entering orphan mode");
-		title("orphan");
-	} else {
-		say_info("leaving orphan mode");
-		title("running");
-	}
+	box_set_ro_mode_active(box_ro_orphan, orphan, true);
+	box_check_recovery_state_synced_is_reached();
 }
 
 struct wal_stream {
@@ -2704,6 +2806,48 @@ box_quorum_on_ack_f(struct trigger *trigger, void *event)
 		trigger_clear(trigger);
 	}
 	return 0;
+}
+
+/**
+ * A trigger that is set on the wal_on_write event to track the moment when the
+ * instance receives from the replicaset all of its transactions that it lost.
+ */
+struct {
+	/** Inherit trigger. */
+	struct trigger base;
+	/** Target LSN to wait for. */
+	int64_t target_lsn;
+} box_check_waiting_for_own_rows_trigger;
+
+static int
+box_check_waiting_for_own_rows_f(struct trigger *trigger, void *event)
+{
+	(void)event;
+	auto &t = box_check_waiting_for_own_rows_trigger;
+	assert((struct trigger *)&t == trigger);
+	int64_t local_lsn = vclock_get(instance_vclock, instance_id);
+	if (local_lsn >= t.target_lsn) {
+		box_set_waiting_for_own_rows(false);
+		trigger_clear(trigger);
+	}
+	return 0;
+}
+
+void
+box_check_waiting_for_own_rows(void)
+{
+	auto &t = box_check_waiting_for_own_rows_trigger;
+	t.target_lsn = replicaset_max_instance_lsn();
+	int64_t local_lsn = vclock_get(instance_vclock, instance_id);
+
+	if (local_lsn < t.target_lsn) {
+		box_set_waiting_for_own_rows(true);
+		trigger_create(&t.base, box_check_waiting_for_own_rows_f,
+			       NULL, NULL);
+		trigger_add(&wal_on_write, &t.base);
+	} else {
+		box_set_waiting_for_own_rows(false);
+	}
 }
 
 /**
@@ -5827,6 +5971,17 @@ local_recovery(const struct vclock *checkpoint_vclock)
 	 * other engines.
 	 */
 	memtx_engine_recover_snapshot_xc(memtx, checkpoint_vclock);
+
+	/**
+	 * All the applier are stopped now on point before subscribing. They are
+	 * stopped at the moment they got the CONNECTED status. Now it need to
+	 * make sure that the current instance is aware of all its own
+	 * transactions. This needs to be done before subscribing, in order to
+	 * correctly determine the id_filter value in the subscribe request.
+	 * The appliers will continue after calling replicaset_follow.
+	 */
+	box_check_waiting_for_own_rows();
+
 	box_run_on_recovery_state(RECOVERY_STATE_SNAPSHOT_RECOVERED);
 	/*
 	 * Xlog starts after snapshot. Hence recovery vclock must point at the
@@ -5881,6 +6036,7 @@ local_recovery(const struct vclock *checkpoint_vclock)
 		if (box_listen() != 0)
 			diag_raise();
 		box_update_replication();
+		box_check_waiting_for_own_rows();
 	} else if (vclock_compare(instance_vclock, &recovery->vclock) != 0) {
 		/*
 		 * There are several reasons for a node to recover a vclock not
@@ -6161,8 +6317,10 @@ box_cfg_xc(void)
 	if (dd_version_id > version_id(2, 10, 1))
 		txn_limbo_filter_enable(&txn_limbo);
 
-	title("running");
-	say_info("ready to accept requests");
+	if (box_max_active_ro_mode == box_ro_none) {
+		title("running");
+		say_info("ready to accept requests");
+	}
 
 	if (!is_bootstrap_leader) {
 		replicaset_sync();

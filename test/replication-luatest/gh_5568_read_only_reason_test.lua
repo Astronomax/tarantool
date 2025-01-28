@@ -112,7 +112,7 @@ g.test_read_only_reason_orphan = function(g)
         return old_timeout, ok, err:unpack()
     end, {fake_uri})
     t.assert(not ok, 'fail ddl')
-    t.assert_str_contains(err.message, read_only_msg..'it is an orphan')
+    t.assert_str_contains(err.message, read_only_msg..'it is in orphan mode')
     t.assert_equals(g.master:exec(function()
         return box.info.ro_reason
     end), "orphan", "ro reason orphan");

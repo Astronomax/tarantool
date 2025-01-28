@@ -67,7 +67,7 @@ pg.test_replica_is_orphan_after_restart = function(cg)
         t.assert(cg.quorum2:eval('return box.space.test ~= nil'))
     end)
     local err_ro_msg = "Can't modify data on a read-only instance - "..
-                       "it is an orphan"
+                       "it is in orphan mode"
     t.assert_error_msg_content_equals(err_ro_msg,
         function()
             cg.quorum2:eval('return box.space.test:replace{100}')
