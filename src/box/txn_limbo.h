@@ -268,7 +268,10 @@ struct txn_limbo {
 	 * `volatile_confirmed_lsn` is updated separately from the
 	 * `confirmed_lsn`.
 	 */
-	struct fiber *worker;
+	struct fiber *confirm_submitter;
+	struct fiber *confirm_retryer;
+	struct mempool confirm_entry_pool;
+	struct rlist confirm_submits;
 };
 
 /**
@@ -277,6 +280,9 @@ struct txn_limbo {
  * appear more than one limbo for master-master support.
  */
 extern struct txn_limbo txn_limbo;
+
+int
+txn_limbo_confirm_write_submit(struct txn_limbo *limbo, int64_t lsn);
 
 static inline bool
 txn_limbo_is_empty(struct txn_limbo *limbo)

@@ -41,65 +41,129 @@
 
 struct txn_limbo txn_limbo;
 
-static int
-txn_limbo_write_synchro(struct txn_limbo *limbo, uint16_t type, int64_t lsn,
-			uint64_t term, struct vclock *vclock);
-
 static void
 txn_limbo_read_confirm(struct txn_limbo *limbo, int64_t lsn);
+
+struct confirm_entry {
+    int64_t lsn;
+    struct rlist in_confirm_submits;
+    char buf[XROW_BODY_LEN_MAX];
+    struct journal_entry base;
+};
+
+struct confirm_entry *
+txn_limbo_last_confirm_entry(struct txn_limbo *limbo)
+{
+	assert(!rlist_empty(&limbo->confirm_submits));
+	return rlist_last_entry(&limbo->confirm_submits,
+				struct confirm_entry,
+				in_confirm_submits);
+}
 
 /**
  * Write a confirmation entry to the WAL. After it's written all the
  * transactions waiting for confirmation may be finished.
  */
-static int
-txn_limbo_write_confirm(struct txn_limbo *limbo, int64_t lsn)
+int
+txn_limbo_confirm_write_submit(struct txn_limbo *limbo, int64_t lsn)
 {
 	assert(lsn > limbo->confirmed_lsn);
 	assert(!limbo->is_in_rollback);
-	return txn_limbo_write_synchro(limbo, IPROTO_RAFT_CONFIRM, lsn, 0,
-				       NULL);
-}
 
-static int
-txn_limbo_worker_bump_confirmed_lsn(struct txn_limbo *limbo)
-{
-	assert(limbo->volatile_confirmed_lsn >= limbo->confirmed_lsn);
-	while (txn_limbo_is_owned_by_current_instance(limbo) &&
-	       limbo->volatile_confirmed_lsn > limbo->confirmed_lsn) {
-		if (limbo->is_in_rollback)
-			return -1;
-		/* It can get bumped again while we are writing. */
-		int64_t volatile_confirmed_lsn = limbo->volatile_confirmed_lsn;
-		if (txn_limbo_write_confirm(limbo,
-					    volatile_confirmed_lsn) != 0) {
-			diag_log();
-			return -1;
-		}
-		ERROR_INJECT_YIELD(ERRINJ_TXN_LIMBO_WORKER_DELAY);
-		txn_limbo_read_confirm(limbo, volatile_confirmed_lsn);
+	if (!rlist_empty(&limbo->confirm_submits)) {
+		assert(txn_limbo_last_confirm_entry(limbo)->lsn < lsn);
+		(void)0;
 	}
-	assert(limbo->volatile_confirmed_lsn >= limbo->confirmed_lsn);
+
+	struct synchro_request req = {
+		.type = IPROTO_RAFT_CONFIRM,
+		.replica_id = limbo->owner_id,
+		.lsn = lsn,
+		.term = 0,
+		.confirmed_vclock = NULL,
+	};
+	struct xrow_header *row =
+		region_aligned_alloc(&fiber()->gc, sizeof(struct xrow_header),
+				     alignof(struct xrow_header));
+	char *body = region_alloc(&fiber()->gc, XROW_BODY_LEN_MAX);
+	xrow_encode_synchro(row, body, &req);
+
+	struct confirm_entry *entry = xmempool_alloc(&limbo->confirm_entry_pool);
+	entry->lsn = lsn;
+	rlist_create(&entry->in_confirm_submits);
+	journal_entry_create(&entry->base, 1, 0, journal_entry_fiber_wakeup_cb,
+			     limbo->confirm_retryer);
+
+	if (entry == NULL)
+		return -1;
+
+	entry->base.rows[0] = row;
+	if (journal_write_submit(&entry->base) != 0)
+		return -1;
+
+	rlist_add_tail_entry(&limbo->confirm_submits, entry, in_confirm_submits);
+	fiber_wakeup(limbo->confirm_retryer);
 	return 0;
 }
 
 static int
-txn_limbo_worker_f(va_list args)
+txn_limbo_confirm_write_retry_f(va_list args)
 {
 	(void)args;
 	struct txn_limbo *limbo = fiber()->f_arg;
 	assert(limbo == &txn_limbo);
 	while (!fiber_is_cancelled()) {
 		fiber_check_gc();
-		ERROR_INJECT_YIELD(ERRINJ_TXN_LIMBO_WORKER_DELAY);
-		if (txn_limbo_worker_bump_confirmed_lsn(limbo) != 0)
-#ifdef TEST_BUILD
-			fiber_sleep(0.01);
-#else
-			fiber_sleep(1);
-#endif
-		else
+		if (rlist_empty(&limbo->confirm_submits)) {
 			fiber_yield();
+			continue;
+		}
+		struct confirm_entry *last =
+			txn_limbo_last_confirm_entry(limbo);
+
+		if (!last->base.is_complete) {
+			fiber_yield();
+			continue;
+		}
+		rlist_del_entry(last, in_confirm_submits);
+		if (last->base.res < 0) {
+			diag_set_journal_res(last->base.res);
+			diag_log();
+		} else {
+			txn_limbo_read_confirm(limbo, last->lsn);
+		}
+		mempool_free(&limbo->confirm_entry_pool, last);
+	}
+	return 0;
+}
+
+bool
+txn_limbo_check_actual_confirm_submitted(struct txn_limbo *limbo)
+{
+	int64_t lsn = limbo->volatile_confirmed_lsn;
+	if (limbo->confirmed_lsn >= lsn)
+		return true;
+	if (!rlist_empty(&limbo->confirm_submits))
+		return txn_limbo_last_confirm_entry(limbo)->lsn >= lsn;
+	return false;
+}
+
+static int
+txn_limbo_confirm_write_submit_f(va_list args)
+{
+	(void)args;
+	struct txn_limbo *limbo = fiber()->f_arg;
+	assert(limbo == &txn_limbo);
+	while (!fiber_is_cancelled()) {
+		fiber_check_gc();
+		if (txn_limbo_check_actual_confirm_submitted(limbo)) {
+			fiber_yield();
+			continue;
+		}
+		while (!journal_queue_is_full() && !journal_queue_has_waiters())
+			journal_queue_wait();
+		if (txn_limbo_confirm_write_submit(limbo, limbo->volatile_confirmed_lsn) != 0)
+			diag_log();
 	}
 	return 0;
 }
@@ -128,12 +192,24 @@ txn_limbo_create(struct txn_limbo *limbo)
 	limbo->confirm_lag = 0;
 	limbo->max_size = 0;
 	limbo->size = 0;
-	limbo->worker = fiber_new_system("txn_limbo_worker",
-					 txn_limbo_worker_f);
-	if (limbo->worker == NULL)
-		panic("failed to allocate synchronous queue worker fiber");
-	limbo->worker->f_arg = limbo;
-	fiber_set_joinable(limbo->worker, true);
+
+	limbo->confirm_submitter =
+		fiber_new_system("txn_limbo_confirm_submitter", txn_limbo_confirm_write_submit_f);
+	if (limbo->confirm_submitter == NULL)
+		panic("failed to allocate synchronous queue confirm-submitter fiber");
+	limbo->confirm_submitter->f_arg = limbo;
+	fiber_set_joinable(limbo->confirm_submitter, true);
+
+	limbo->confirm_retryer =
+		fiber_new_system("txn_limbo_confirm_retryer", txn_limbo_confirm_write_retry_f);
+	if (limbo->confirm_retryer == NULL)
+		panic("failed to allocate synchronous queue confirm-retryer fiber");
+	limbo->confirm_retryer->f_arg = limbo;
+	fiber_set_joinable(limbo->confirm_retryer, true);
+
+	mempool_create(&limbo->confirm_entry_pool, &cord()->slabc,
+		       sizeof(struct confirm_entry) + sizeof(struct xrow_header *));
+	rlist_create(&limbo->confirm_submits);
 }
 
 void
@@ -159,8 +235,10 @@ txn_limbo_destroy(struct txn_limbo *limbo)
 static inline void
 txn_limbo_stop(struct txn_limbo *limbo)
 {
-	fiber_cancel(limbo->worker);
-	VERIFY(fiber_join(limbo->worker) == 0);
+	fiber_cancel(limbo->confirm_submitter);
+	VERIFY(fiber_join(limbo->confirm_submitter) == 0);
+	fiber_cancel(limbo->confirm_retryer);
+	VERIFY(fiber_join(limbo->confirm_retryer) == 0);
 }
 
 static inline bool
@@ -527,23 +605,6 @@ synchro_request_write(const struct synchro_request *req)
 	return journal_write_row(&row);
 }
 
-/** Create a request for a specific limbo and write it to WAL. */
-static int
-txn_limbo_write_synchro(struct txn_limbo *limbo, uint16_t type, int64_t lsn,
-			uint64_t term, struct vclock *vclock)
-{
-	assert(lsn >= 0);
-
-	struct synchro_request req = {
-		.type = type,
-		.replica_id = limbo->owner_id,
-		.lsn = lsn,
-		.term = term,
-		.confirmed_vclock = vclock,
-	};
-	return synchro_request_write(&req);
-}
-
 /** Write a request to WAL or panic. */
 static void
 synchro_request_write_or_panic(const struct synchro_request *req)
@@ -663,7 +724,12 @@ txn_limbo_confirm_lsn(struct txn_limbo *limbo, int64_t confirm_lsn)
 {
 	assert(confirm_lsn > limbo->volatile_confirmed_lsn);
 	limbo->volatile_confirmed_lsn = confirm_lsn;
-	fiber_wakeup(limbo->worker);
+
+	if (!journal_queue_is_full() && !journal_queue_has_waiters() &&
+	    txn_limbo_confirm_write_submit(limbo, confirm_lsn) == 0)
+		return;
+
+	fiber_wakeup(limbo->confirm_submitter);
 }
 
 /**
