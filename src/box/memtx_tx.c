@@ -57,18 +57,6 @@ static_assert((int)MEMTX_TX_ROLLBACKED_PSN < (int)TXN_MIN_PSN,
  * key in index.
  */
 struct memtx_story_link {
-	/**
-	 * For a statement in transaction `TXN`, `is_own_change == true`
-	 * in story `A` for index `I` means:
-	 * - The tuple `A` replaced a tuple `B` that was added by
-	 *   this same transaction, and `A->tuple[I] == B->tuple[I]`;
-	 * - OR the key `A->tuple[I]` was not present in index `I` because this
-	 *   transaction `TXN` had previously executed a statement that removed/
-	 *   replaced a tuple `B`, such that `A->tuple[I] == B->tuple[I]` and
-	 *   this is guaranteed to always remain true (due to the presence of a
-	 *   read tracker or some other conditions).
-	 */
-	bool is_own_change;
 	/** Story that was happened after that story was ended. */
 	struct memtx_story *newer_story;
 	/** Story that was happened before that story was started. */
@@ -147,6 +135,7 @@ struct memtx_story {
 	 * Whether there is an associated functional key in `func_key_storage`.
 	 */
 	bool has_func_key;
+	struct mh_dels_t *dels;
 	/**
 	 * Link with older and newer stories (and just tuples) for each
 	 * index respectively.
@@ -519,6 +508,52 @@ func_key_storage_key_equal(const struct func_key_storage_key *key,
 #define mh_hash_key(a, arg) func_key_storage_key_hash(a)
 #define mh_cmp(a, b, arg) func_key_storage_equal((a), (b))
 #define mh_cmp_key(a, b, arg) func_key_storage_key_equal((a), (b))
+#define MH_SOURCE
+#include "salad/mhash.h"
+
+/** Key for search in `dels`. */
+typedef struct txn * dels_key;
+
+/** Hash calculator for key of `dels`. */
+static uint32_t
+dels_key_hash(const dels_key key)
+{
+	static_assert(sizeof(uintptr_t) > sizeof(uint32_t),
+		      "The following code relies on it");
+	uintptr_t u = (uintptr_t)key;
+	return u ^ (u >> 32);
+}
+
+/** An element of `dels`. */
+struct dels_item {
+	dels_key key;
+	struct txn_stmt *stmt;
+	/** Hash of the item. */
+	uint32_t hash;
+};
+
+/** Comparator for element and key of `dels`. */
+static int
+dels_key_equal(const dels_key key, const struct dels_item *object)
+{
+	return key != object->key;
+}
+
+/** Comparator for elements of `dels`. */
+static int
+dels_equal(const struct dels_item *obj1, const struct dels_item *obj2)
+{
+	return obj1->key != obj2->key;
+}
+
+#define mh_name _dels
+#define mh_key_t dels_key
+#define mh_node_t struct dels_item
+#define mh_arg_t int
+#define mh_hash(a, arg) ((a)->hash)
+#define mh_hash_key(a, arg) dels_key_hash(a)
+#define mh_cmp(a, b, arg) dels_equal((a), (b))
+#define mh_cmp_key(a, b, arg) dels_key_equal((a), (b))
 #define MH_SOURCE
 #include "salad/mhash.h"
 
@@ -1170,8 +1205,8 @@ memtx_tx_story_new(struct space *space, struct tuple *tuple)
 	rlist_create(&story->reader_list);
 	rlist_add_tail(&txm.all_stories, &story->in_all_stories);
 	rlist_add(&space->memtx_stories, &story->in_space_stories);
+	story->dels = mh_dels_new();
 	for (uint32_t i = 0; i < index_count; i++) {
-		story->link[i].is_own_change = false;
 		story->link[i].newer_story = story->link[i].older_story = NULL;
 		rlist_create(&story->link[i].read_gaps);
 		story->link[i].in_index = space->index[i];
@@ -1216,6 +1251,9 @@ memtx_tx_story_delete(struct memtx_story *story)
 
 	tuple_clear_flag(story->tuple, TUPLE_IS_DIRTY);
 	tuple_unref(story->tuple);
+
+	assert(mh_size(story->dels) == 0);
+	mh_dels_delete(story->dels);
 
 	struct mempool *pool = &txm.memtx_tx_story_pool[story->index_count];
 	mempool_free(pool, story);
@@ -1279,6 +1317,14 @@ memtx_tx_story_link_deleted_by(struct memtx_story *story,
 	stmt->del_story = story;
 	stmt->next_in_del_list = story->del_stmt;
 	story->del_stmt = stmt;
+
+	struct dels_item item = {
+		.key = stmt->txn,
+		.stmt = stmt,
+		.hash = dels_key_hash(stmt->txn),
+	};
+	mh_int_t pos = mh_dels_put(story->dels, &item, NULL, 0);
+	VERIFY(pos != mh_end(story->dels));
 }
 
 /**
@@ -1300,6 +1346,10 @@ memtx_tx_story_unlink_deleted_by(struct memtx_story *story,
 	*ptr = stmt->next_in_del_list;
 	stmt->next_in_del_list = NULL;
 	stmt->del_story = NULL;
+
+	mh_int_t pos = mh_dels_find(story->dels, stmt->txn, 0);
+	VERIFY(pos != mh_end(story->dels));
+	mh_dels_del(story->dels, pos, 0);
 }
 
 /**
@@ -2093,14 +2143,13 @@ check_dup(struct txn_stmt *stmt, struct tuple **directly_replaced,
 	struct tuple *visible_replaced;
 	if (directly_replaced[0] == NULL ||
 	    !tuple_has_flag(directly_replaced[0], TUPLE_IS_DIRTY)) {
-		add_story->link[0].is_own_change = false;
+		stmt->is_own_change = false;
 		visible_replaced = directly_replaced[0];
 	} else {
 		struct memtx_story *story =
 			memtx_tx_story_get(directly_replaced[0]);
-		memtx_tx_story_find_visible_tuple(
-			story, txn, 0, true, &visible_replaced,
-			&add_story->link[0].is_own_change);
+		memtx_tx_story_find_visible_tuple(story, txn, 0, true,
+			&visible_replaced, &stmt->is_own_change);
 	}
 
 	if (index_check_dup(space->index[0], *old_tuple, new_tuple,
@@ -2120,7 +2169,6 @@ check_dup(struct txn_stmt *stmt, struct tuple **directly_replaced,
 		struct tuple *visible;
 		if (!tuple_has_flag(directly_replaced[i], TUPLE_IS_DIRTY)) {
 			visible = directly_replaced[i];
-			add_story->link[i].is_own_change = false;
 		} else {
 			/*
 			 * The replaced tuple is dirty. A chain of changes
@@ -2129,9 +2177,9 @@ check_dup(struct txn_stmt *stmt, struct tuple **directly_replaced,
 			 */
 			struct memtx_story *story =
 				memtx_tx_story_get(directly_replaced[i]);
+			bool unused;
 			memtx_tx_story_find_visible_tuple(
-				story, txn, i, true, &visible,
-				&add_story->link[i].is_own_change);
+				story, txn, i, true, &visible, &unused);
 		}
 
 		if (index_check_dup(space->index[i], visible_replaced,
@@ -2375,7 +2423,7 @@ memtx_tx_history_add_insert_stmt(struct txn_stmt *stmt,
 	 * transaction can interfere with insert: due to serialization the
 	 * previous delete statement guarantees that the insert will not fail.
 	 */
-	if (!add_story->link[0].is_own_change &&
+	if (!stmt->is_own_change &&
 	    (mode == DUP_INSERT ||
 	     space_has_before_replace_triggers(stmt->space) ||
 	     space_has_on_replace_triggers(stmt->space))) {
@@ -2433,7 +2481,7 @@ memtx_tx_history_add_delete_stmt(struct txn_stmt *stmt,
 	assert(tuple_has_flag(old_tuple, TUPLE_IS_DIRTY));
 	struct memtx_story *del_story = memtx_tx_story_get(old_tuple);
 	if (del_story->add_stmt != NULL)
-		stmt->is_own_delete = del_story->add_stmt->txn == stmt->txn;
+		stmt->is_own_change = del_story->add_stmt->txn == stmt->txn;
 	memtx_tx_story_link_deleted_by(del_story, stmt);
 
 	/*
@@ -2547,9 +2595,14 @@ memtx_tx_handle_dups_in_secondary_index(
 		 * Ignore case when other TX executes insert after
 		 * precedence delete.
 		 */
-		if (newer_story->link[ind].is_own_change &&
-		    test_stmt->del_story == NULL)
-			continue;
+		mh_int_t pos = mh_dels_find(story->dels, test_stmt->txn, 0);
+		if (pos != mh_end(story->dels)) {
+			struct txn_stmt *del_stmt =
+				mh_dels_node(story->dels, pos)->stmt;
+			assert(del_stmt != NULL);
+			if (del_stmt != test_stmt)
+				continue;
+		}
 		/*
 		 * Ignore the case when other TX overwrites in both
 		 * primary and secondary index.
@@ -2591,6 +2644,19 @@ memtx_tx_handle_dups_and_gaps_on_rollback(struct memtx_story *story)
 		 */
 		memtx_tx_abort_gap_readers_on_rollback(top_story, i);
 	}
+}
+
+static void
+memtx_tx_story_unlink_deleted_by_first(struct txn_stmt **from, struct txn_stmt *test_stmt) {
+	assert(*from == test_stmt);
+	struct memtx_story *del_story = test_stmt->del_story;
+	*from = test_stmt->next_in_del_list;
+	test_stmt->next_in_del_list = NULL;
+	test_stmt->del_story = NULL;
+
+	mh_int_t pos = mh_dels_find(del_story->dels, test_stmt->txn, 0);
+	VERIFY(pos != mh_end(del_story->dels));
+	mh_dels_del(del_story->dels, pos, 0);
 }
 
 /*
@@ -2644,14 +2710,11 @@ memtx_tx_history_rollback_added_story(struct txn_stmt *stmt)
 			assert(test_stmt->txn != stmt->txn);
 			struct memtx_story *test_story = test_stmt->add_story;
 			(void)test_story;
-			assert(!(test_story == NULL ? test_stmt->is_own_delete :
-			       test_story->link[0].is_own_change));
+			assert(!test_stmt->is_own_change);
 			assert(test_stmt->txn->psn == 0);
 
 			/* Unlink from add_story list. */
-			*from = test_stmt->next_in_del_list;
-			test_stmt->next_in_del_list = NULL;
-			test_stmt->del_story = NULL;
+			memtx_tx_story_unlink_deleted_by_first(from, test_stmt);
 
 			if (del_story != NULL) {
 				/* Link to del_story's list. */
@@ -2737,7 +2800,7 @@ memtx_tx_history_rollback_deleted_story(struct txn_stmt *stmt)
 		     test_story != NULL;
 		     test_story = test_story->link[0].newer_story) {
 			struct txn_stmt *test_stmt = test_story->add_stmt;
-			if (test_story->link[0].is_own_change)
+			if (test_stmt->is_own_change)
 				continue;
 			assert(test_stmt->txn != stmt->txn);
 			assert(test_stmt->del_story == NULL);
@@ -2929,7 +2992,7 @@ memtx_tx_history_prepare_insert_stmt(struct txn_stmt *stmt)
 		     test_story != NULL;
 		     test_story = test_story->link[0].newer_story) {
 			struct txn_stmt *test_stmt = test_story->add_stmt;
-			if (test_story->link[0].is_own_change)
+			if (test_stmt->is_own_change)
 				continue;
 			assert(test_stmt->txn != stmt->txn);
 			assert(test_stmt->del_story == NULL);
@@ -2958,9 +3021,7 @@ memtx_tx_history_prepare_insert_stmt(struct txn_stmt *stmt)
 			assert(test_stmt->txn->psn == 0);
 
 			/* Unlink from old story list. */
-			*from = test_stmt->next_in_del_list;
-			test_stmt->next_in_del_list = NULL;
-			test_stmt->del_story = NULL;
+			memtx_tx_story_unlink_deleted_by_first(from, test_stmt);
 
 			/* Link to story's list. */
 			memtx_tx_story_link_deleted_by(story, test_stmt);
@@ -3036,9 +3097,7 @@ memtx_tx_history_prepare_delete_stmt(struct txn_stmt *stmt)
 		assert(test_stmt->txn->psn == 0);
 
 		/* Unlink from old story list. */
-		*from = test_stmt->next_in_del_list;
-		test_stmt->next_in_del_list = NULL;
-		test_stmt->del_story = NULL;
+		memtx_tx_story_unlink_deleted_by_first(from, test_stmt);
 	}
 
 	/*
