@@ -42,6 +42,7 @@
 #include "vy_stat.h"
 #include "index_def.h"
 #include "xlog.h"
+#include "vy_page_index.h"
 
 #include "small/mempool.h"
 
@@ -74,6 +75,8 @@ struct vy_run_env {
 	 * unconditionally remove unused runs' files in-place.
 	 */
 	bool initial_join;
+	/** Cache environment for vy_page_index objects. */
+	struct vy_page_index_cache_env page_index_cache_env;
 };
 
 /**
@@ -126,6 +129,10 @@ struct vy_run {
 	struct vy_run_info info;
 	/** Info about the run pages stored in the index file. */
 	struct vy_page_info *page_info;
+	/** Page index (cache + on-disk btree). */
+	struct vy_page_index page_index;
+	/** Path to the page index file (owned by the run). */
+	char *page_index_filepath;
 	/** Run data file. */
 	int fd;
 	/** Unique ID of this run. */
@@ -379,9 +386,9 @@ vy_run_unref(struct vy_run *run)
  * With a reasonable degree of error, return the number of statements
  * stored in the given range.
  */
-int64_t
-vy_run_estimate_stmt_count(struct vy_run *run, struct key_def *cmp_def,
-			   struct vy_entry begin, struct vy_entry end);
+int
+vy_run_estimate_stmt_count(struct vy_run *run, struct vy_entry begin,
+			   struct vy_entry end, int64_t *result);
 
 /**
  * With a reasonable degree of error, return the key of the statement
@@ -389,9 +396,9 @@ vy_run_estimate_stmt_count(struct vy_run *run, struct key_def *cmp_def,
  *
  * The returned key belongs to the run so it must not be modified or freed.
  */
-const char *
-vy_run_estimate_key_at(struct vy_run *run, struct key_def *cmp_def,
-		       struct vy_entry begin, int64_t offset);
+int
+vy_run_estimate_key_at(struct vy_run *run, struct vy_entry begin,
+		       int64_t offset, const char **result);
 
 /**
  * Load run from disk
@@ -430,6 +437,8 @@ enum vy_file_type {
 	VY_FILE_INDEX_INPROGRESS,
 	VY_FILE_RUN,
 	VY_FILE_RUN_INPROGRESS,
+	VY_FILE_PAGE_INDEX,
+	VY_FILE_PAGE_INDEX_INPROGRESS,
 	vy_file_MAX,
 };
 
@@ -488,8 +497,8 @@ vy_run_remove_files(const char *dir, uint32_t space_id,
  * This function increments @run->refs.
  */
 struct vy_slice *
-vy_slice_new(int64_t id, struct vy_run *run, struct vy_entry begin,
-	     struct vy_entry end, struct key_def *cmp_def);
+vy_slice_new(int64_t id, struct vy_run *run,
+	     struct vy_entry begin, struct vy_entry end);
 
 /**
  * Free a run slice.

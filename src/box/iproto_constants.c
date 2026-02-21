@@ -124,3 +124,10 @@ const char *vy_page_info_key_strs[vy_page_info_key_MAX] = {
 const char *vy_row_index_key_strs[vy_row_index_key_MAX] = {
 	VY_ROW_INDEX_KEYS(VY_ROW_INDEX_KEY_STRS_MEMBER)
 };
+
+#define VY_BTREE_KEY_STRS_MEMBER(s, ...) \
+	[VY_BTREE_ ## s] = #s,
+
+const char *vy_btree_key_strs[vy_btree_key_MAX] = {
+	VY_BTREE_KEYS(VY_BTREE_KEY_STRS_MEMBER)
+};

@@ -211,7 +211,7 @@ test_basic()
 
 	vy_lsm_add_run(pk, run);
 	struct vy_slice *slice = vy_slice_new(1, run, vy_entry_none(),
-					      vy_entry_none(), pk->cmp_def);
+					      vy_entry_none());
 	vy_range_add_slice(range, slice);
 	vy_run_unref(run);
 
@@ -241,8 +241,7 @@ test_basic()
 	vy_mem_delete(run_mem);
 
 	vy_lsm_add_run(pk, run);
-	slice = vy_slice_new(1, run, vy_entry_none(), vy_entry_none(),
-			     pk->cmp_def);
+	slice = vy_slice_new(1, run, vy_entry_none(), vy_entry_none());
 	vy_range_add_slice(range, slice);
 	vy_run_unref(run);
 

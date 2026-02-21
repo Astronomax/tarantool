@@ -42,7 +42,8 @@ result = {}
 test_run:cmd("setopt delimiter ';'")
 for i, path in pairs(files) do
     local suffix = string.gsub(path, '.*%.', '')
-    if suffix ~= 'snap' and suffix ~= 'xlog' then
+    if suffix ~= 'snap' and suffix ~= 'xlog'
+    and suffix ~= 'btree' and suffix ~= 'inprogress' then
         local rows = {}
         local i = 1
         for lsn, row in xlog.pairs(path) do

@@ -222,6 +222,7 @@ set(box_sources
     vy_scheduler.c
     vy_regulator.c
     vy_quota.c
+    vy_page_index.c
     request.c
     space.c
     space_cache.c

@@ -417,7 +417,7 @@ vy_lsm_recover_slice(struct vy_lsm *lsm, struct vy_range *range,
 	if (run == NULL)
 		goto out;
 
-	slice = vy_slice_new(slice_info->id, run, begin, end, lsm->cmp_def);
+	slice = vy_slice_new(slice_info->id, run, begin, end);
 	if (slice == NULL)
 		goto out;
 
@@ -1325,8 +1325,11 @@ vy_lsm_quantile(struct vy_lsm *lsm, double level,
 		if (!rlist_empty(&range->slices)) {
 			struct vy_slice *slice = rlist_last_entry(
 				&range->slices, struct vy_slice, in_range);
-			total += vy_run_estimate_stmt_count(
-				slice->run, cmp_def, range_begin, range_end);
+			int64_t count;
+			if (vy_run_estimate_stmt_count(slice->run, range_begin,
+						       range_end, &count) != 0)
+				return -1;
+			total += count;
 		}
 		if (range == last_range)
 			break;
@@ -1352,14 +1355,17 @@ vy_lsm_quantile(struct vy_lsm *lsm, double level,
 			continue;
 		struct vy_slice *slice = rlist_last_entry(
 			&range->slices, struct vy_slice, in_range);
-		int64_t count = vy_run_estimate_stmt_count(
-			slice->run, cmp_def, range_begin, range_end);
+		int64_t count;
+		if (vy_run_estimate_stmt_count(slice->run, range_begin,
+					       range_end, &count) != 0)
+			return -1;
 		if (offset >= count) {
 			offset -= count;
 			continue;
 		}
-		key = vy_run_estimate_key_at(slice->run, cmp_def,
-					     range_begin, offset);
+		if (vy_run_estimate_key_at(slice->run, range_begin,
+					   offset, &key) != 0)
+			return -1;
 		break;
 	}
 	if (key == NULL)

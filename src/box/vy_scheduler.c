@@ -1215,7 +1215,7 @@ vy_task_dump_complete(struct vy_task *task)
 	for (range = begin_range, i = 0; range != end_range;
 	     range = vy_range_tree_next(&lsm->range_tree, range), i++) {
 		slice = vy_slice_new(vy_log_next_id(), new_run,
-				     range->begin, range->end, lsm->cmp_def);
+				     range->begin, range->end);
 		if (slice == NULL)
 			goto fail_free_slices;
 
@@ -1513,8 +1513,7 @@ vy_task_compaction_complete(struct vy_task *task)
 	 */
 	if (!vy_run_is_empty(new_run)) {
 		new_slice = vy_slice_new(vy_log_next_id(), new_run,
-					 vy_entry_none(), vy_entry_none(),
-					 lsm->cmp_def);
+					 vy_entry_none(), vy_entry_none());
 		if (new_slice == NULL)
 			return -1;
 	}

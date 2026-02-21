@@ -31,6 +31,7 @@
 #include "vy_run.h"
 
 #include <zstd.h>
+#include <errno.h>
 
 #include "fiber.h"
 #include "fiber_cond.h"
@@ -69,6 +70,8 @@ const char *vy_file_suffix[] = {
 	"index" inprogress_suffix, 	/* VY_FILE_INDEX_INPROGRESS */
 	"run",				/* VY_FILE_RUN */
 	"run" inprogress_suffix, 	/* VY_FILE_RUN_INPROGRESS */
+	"btree",			/* VY_FILE_PAGE_INDEX */
+	"btree" inprogress_suffix,	/* VY_FILE_PAGE_INDEX_INPROGRESS */
 };
 
 /* sync run and index files very 16 MB */
@@ -189,6 +192,8 @@ vy_run_env_create(struct vy_run_env *env, int read_threads)
 	mempool_create(&env->read_task_pool, cord_slab_cache(),
 		       sizeof(struct vy_page_read_task));
 	env->initial_join = false;
+	vy_page_index_cache_env_create(&env->page_index_cache_env,
+				       cord_slab_cache());
 }
 
 /**
@@ -201,6 +206,7 @@ vy_run_env_destroy(struct vy_run_env *env)
 		vy_run_env_stop_readers(env);
 	mempool_destroy(&env->read_task_pool);
 	tt_pthread_key_delete(env->zdctx_key);
+	vy_page_index_cache_env_destroy(&env->page_index_cache_env);
 }
 
 /**
@@ -256,14 +262,59 @@ vy_page_info_create(struct vy_page_info *page_info, uint64_t offset,
 	page_info->min_key_hint = key_hint(min_key, part_count, cmp_def);
 }
 
-/**
- * Destroy page info struct
- */
-static void
+void
 vy_page_info_destroy(struct vy_page_info *page_info)
 {
 	if (page_info->min_key != NULL)
 		free(page_info->min_key);
+}
+
+struct vy_page_info *
+vy_page_info_new(void)
+{
+	struct vy_page_info *page_info = calloc(1, sizeof(*page_info));
+	if (page_info == NULL) {
+		diag_set(OutOfMemory, sizeof(*page_info), "calloc",
+			 "struct vy_page_info");
+		return NULL;
+	}
+	return page_info;
+}
+
+void
+vy_page_info_delete(struct vy_page_info *page_info)
+{
+	if (page_info == NULL)
+		return;
+	vy_page_info_destroy(page_info);
+	free(page_info);
+}
+
+struct vy_page_info *
+vy_page_info_copy(struct vy_page_info *page_info) {
+	struct vy_page_info *copy = vy_page_info_new();
+	if (copy == NULL)
+		return NULL;
+	copy->min_key = mp_dup(page_info->min_key);
+	return copy;
+}
+
+int
+vy_page_info_compare(const struct vy_page_info *a,
+		     const struct vy_page_info *b,
+		     struct key_def *cmp_def)
+{
+	return vy_key_compare(a->min_key, a->min_key_hint,
+			      b->min_key, b->min_key_hint, cmp_def);
+}
+
+int
+vy_page_info_compare_with_entry(const struct vy_page_info *page_info,
+				struct vy_entry key,
+				struct key_def *cmp_def)
+{
+	return vy_entry_compare_with_raw_key(key, page_info->min_key,
+					     page_info->min_key_hint, cmp_def);
 }
 
 struct vy_run *
@@ -279,6 +330,7 @@ vy_run_new(struct vy_run_env *env, int64_t id)
 	run->id = id;
 	run->dump_lsn = -1;
 	run->fd = -1;
+	run->page_index.btree.fd = -1;
 	run->refs = 1;
 	rlist_create(&run->in_lsm);
 	rlist_create(&run->in_unused);
@@ -288,6 +340,11 @@ vy_run_new(struct vy_run_env *env, int64_t id)
 static void
 vy_run_clear(struct vy_run *run)
 {
+	if (run->page_index_filepath != NULL) {
+		vy_page_index_destroy(&run->page_index);
+		free(run->page_index_filepath);
+		run->page_index_filepath = NULL;
+	}
 	if (run->page_info != NULL) {
 		uint32_t page_no;
 		for (page_no = 0; page_no < run->info.page_count; ++page_no)
@@ -324,92 +381,9 @@ vy_run_bloom_size(struct vy_run *run)
 	return run->info.bloom == NULL ? 0 : tuple_bloom_size(run->info.bloom);
 }
 
-/**
- * Find a page from which the iteration of a given key must be started.
- * LE and LT: the found page definitely contains the position
- *  for iteration start.
- * GE, GT, EQ: Since page search uses only min_key of pages,
- *  it may happen that the found page doesn't contain the position
- *  for iteration start. In this case it is certain that the iteration
- *  must be started from the beginning of the next page.
- *
- * @param run - run
- * @param key - key to find
- * @param key_def - key_def for comparison
- * @param itype - iterator type (see above)
- * @param equal_key: *equal_key is set to true if there is a page
- *  with min_key equal to the given key.
- * @return offset of the page in page index OR run->info.page_count if
- *  there no pages fulfilling the conditions.
- */
-static uint32_t
-vy_page_index_find_page(struct vy_run *run, struct vy_entry key,
-			struct key_def *cmp_def, enum iterator_type itype,
-			bool *equal_key)
-{
-	if (itype == ITER_EQ)
-		itype = ITER_GE; /* One day it'll become obsolete */
-	assert(itype == ITER_GE || itype == ITER_GT ||
-	       itype == ITER_LE || itype == ITER_LT);
-	int dir = iterator_direction(itype);
-	*equal_key = false;
-
-	/**
-	 * Binary search in page index. Depends on given iterator_type:
-	 *  ITER_GE: lowest page with min_key >= given key.
-	 *  ITER_GT: lowest page with min_key > given key.
-	 *  ITER_LE: highest page with min_key <= given key.
-	 *  ITER_LT: highest page with min_key < given key.
-	 *
-	 * Example: we are searching for a value 2 in the run of 10 pages:
-	 * min_key:         [1   1   2   2   2   2   2   3   3   3]
-	 * we want to find: [    LT  GE              LE  GT       ]
-	 * For LT and GE it's a classical lower_bound search.
-	 * Let's set up a range with left page's min_key < key and
-	 *  right page's min >= key; binary cut the range until it
-	 *  becomes of length 1 and then LT pos = left bound of the range
-	 *  and GE pos = right bound of the range.
-	 * For LE and GT it's a classical upper_bound search.
-	 * Let's set up a range with left page's min_key <= key and
-	 *  right page's min > key; binary cut the range until it
-	 *  becomes of length 1 and then LE pos = left bound of the range
-	 *  and GT pos = right bound of the range.
-	 */
-	bool is_lower_bound = itype == ITER_LT || itype == ITER_GE;
-
-	assert(run->info.page_count > 0);
-	/* Initially the range is set with virtual positions */
-	int32_t range[2] = { -1, run->info.page_count };
-	assert(run->info.page_count > 0);
-	do {
-		int32_t mid = range[0] + (range[1] - range[0]) / 2;
-		struct vy_page_info *info = vy_run_page_info(run, mid);
-		int cmp = vy_entry_compare_with_raw_key(key, info->min_key,
-							info->min_key_hint,
-							cmp_def);
-		if (is_lower_bound)
-			range[cmp <= 0] = mid;
-		else
-			range[cmp < 0] = mid;
-		*equal_key = *equal_key || cmp == 0;
-	} while (range[1] - range[0] > 1);
-	if (range[0] < 0)
-		range[0] = run->info.page_count;
-	uint32_t page = range[dir > 0];
-
-	/**
-	 * Since page search uses only min_key of pages,
-	 *  for GE, GT and EQ the previous page can contain
-	 *  the point where iteration must be started.
-	 */
-	if (page > 0 && dir > 0)
-		return page - 1;
-	return page;
-}
-
 struct vy_slice *
-vy_slice_new(int64_t id, struct vy_run *run, struct vy_entry begin,
-	     struct vy_entry end, struct key_def *cmp_def)
+vy_slice_new(int64_t id, struct vy_run *run,
+	     struct vy_entry begin, struct vy_entry end)
 {
 	struct vy_slice *slice = malloc(sizeof(*slice));
 	if (slice == NULL) {
@@ -440,17 +414,17 @@ vy_slice_new(int64_t id, struct vy_run *run, struct vy_entry begin,
 	if (slice->begin.stmt == NULL) {
 		slice->first_page_no = 0;
 	} else {
-		slice->first_page_no =
-			vy_page_index_find_page(run, slice->begin, cmp_def,
-						ITER_GE, &unused);
+		if (vy_page_index_find_page(&run->page_index, slice->begin, ITER_GE,
+					    &slice->first_page_no, &unused) != 0)
+			return NULL;
 		assert(slice->first_page_no < run->info.page_count);
 	}
 	if (slice->end.stmt == NULL) {
 		slice->last_page_no = run->info.page_count - 1;
 	} else {
-		slice->last_page_no =
-			vy_page_index_find_page(run, slice->end, cmp_def,
-						ITER_LT, &unused);
+		if (vy_page_index_find_page(&run->page_index, slice->end, ITER_LT,
+					    &slice->last_page_no, &unused) != 0)
+			return NULL;
 		if (slice->last_page_no == run->info.page_count) {
 			/* It's an empty slice */
 			slice->first_page_no = 0;
@@ -515,7 +489,7 @@ vy_slice_cut(struct vy_slice *slice, int64_t id, struct vy_entry begin,
 						  cmp_def) > 0))
 		end = slice->end;
 
-	*result = vy_slice_new(id, slice->run, begin, end, cmp_def);
+	*result = vy_slice_new(id, slice->run, begin, end);
 	if (*result == NULL)
 		return -1; /* OOM */
 
@@ -533,7 +507,7 @@ vy_slice_cut(struct vy_slice *slice, int64_t id, struct vy_entry begin,
  * @retval  0 Success.
  * @retval -1 Error.
  */
-static int
+int
 vy_page_info_decode(struct vy_page_info *page, const struct xrow_header *xrow,
 		    struct key_def *cmp_def, const char *filename)
 {
@@ -1144,9 +1118,10 @@ vy_run_iterator_search(struct vy_run_iterator *itr,
 		       enum iterator_type iterator_type, struct vy_entry key,
 		       struct vy_run_iterator_pos *pos, bool *equal_key)
 {
-	pos->page_no = vy_page_index_find_page(itr->slice->run, key,
-					       itr->cmp_def, iterator_type,
-					       equal_key);
+	if (vy_page_index_find_page(&itr->slice->run->page_index, key,
+				    iterator_type, &pos->page_no,
+				    equal_key) != 0)
+		return -1;
 	if (pos->page_no == itr->slice->run->info.page_count)
 		return 1;
 	bool equal_in_page;
@@ -1658,15 +1633,19 @@ vy_run_iterator_close(struct vy_run_iterator *itr)
 
 /* }}} vy_run_iterator API implementation */
 
-int64_t
-vy_run_estimate_stmt_count(struct vy_run *run, struct key_def *cmp_def,
-			   struct vy_entry begin, struct vy_entry end)
+int
+vy_run_estimate_stmt_count(struct vy_run *run, struct vy_entry begin,
+			   struct vy_entry end, int64_t *result)
 {
 	bool unused;
-	uint32_t first_page_no = vy_page_index_find_page(run, begin, cmp_def,
-							 ITER_GE, &unused);
-	uint32_t last_page_no = vy_page_index_find_page(run, end, cmp_def,
-							ITER_LT, &unused);
+	uint32_t first_page_no;
+	if (vy_page_index_find_page(&run->page_index, begin, ITER_GE,
+				    &first_page_no, &unused) != 0)
+		return -1;	
+	uint32_t last_page_no;
+	if (vy_page_index_find_page(&run->page_index, end, ITER_LT,
+				    &last_page_no, &unused) != 0)
+		return -1;
 	assert(last_page_no >= first_page_no);
 	/*
 	 * Calculate the number of statements in the range assuming that
@@ -1674,17 +1653,20 @@ vy_run_estimate_stmt_count(struct vy_run *run, struct key_def *cmp_def,
 	 */
 	int64_t rows_per_page = run->count.rows / run->count.pages;
 	assert(rows_per_page > 0);
-	return rows_per_page * (last_page_no - first_page_no + 1);
+	*result = rows_per_page * (last_page_no - first_page_no + 1);
+	return 0;
 }
 
-const char *
-vy_run_estimate_key_at(struct vy_run *run, struct key_def *cmp_def,
-		       struct vy_entry begin, int64_t offset)
+int
+vy_run_estimate_key_at(struct vy_run *run, struct vy_entry begin,
+		       int64_t offset, const char **result)
 {
 	assert(offset >= 0);
 	bool unused;
-	uint32_t first_page_no = vy_page_index_find_page(run, begin, cmp_def,
-							 ITER_GE, &unused);
+	uint32_t first_page_no = 0;
+	if (vy_page_index_find_page(&run->page_index, begin, ITER_GE,
+				    &first_page_no, &unused) != 0)
+		return -1;
 	/*
 	 * Find the target page assuming that all pages store roughly
 	 * the same number of statements.
@@ -1692,10 +1674,13 @@ vy_run_estimate_key_at(struct vy_run *run, struct key_def *cmp_def,
 	int64_t rows_per_page = run->count.rows / run->count.pages;
 	assert(rows_per_page > 0);
 	int64_t page_no = first_page_no + offset / rows_per_page;
-	if (page_no >= run->info.page_count)
-		return NULL;
+	if (page_no >= run->info.page_count) {
+		*result = NULL;
+		return 0;
+	}
 	struct vy_page_info *page_info = vy_run_page_info(run, page_no);
-	return page_info->min_key;
+	*result = page_info->min_key;
+	return 0;
 }
 
 /** Account a page to run statistics. */
@@ -1713,18 +1698,44 @@ vy_run_acct_page(struct vy_run *run, struct vy_page_info *page)
 }
 
 int
-vy_run_recover(struct vy_run *run, const char *dir,
-	       uint32_t space_id, uint32_t iid, struct key_def *cmp_def)
+vy_run_build_page_index(struct vy_page_info *page_info_array,
+			uint32_t page_count, const char *btree_path,
+			struct key_def *cmp_def,
+			uint64_t *root_offset, uint64_t *data_offset)
 {
+	struct vy_page_index_entry *entries = region_alloc(
+		&fiber()->gc, (size_t)page_count * sizeof(*entries));
+	if (entries == NULL) {
+		diag_set(OutOfMemory, (size_t)page_count *
+			 sizeof(*entries), "region_alloc",
+			 "page index entries");
+		return -1;
+	}
+	for (uint32_t page_no = 0; page_no < page_count; page_no++) {
+		entries[page_no].idx = (int32_t)page_no;
+		entries[page_no].min_key = page_info_array[page_no].min_key;
+		entries[page_no].min_key_hint =
+			page_info_array[page_no].min_key_hint;
+	}
+	struct vy_page_index_btree built = {0};
+	built.fd = -1;
+	if (vy_page_index_btree_build(&built, entries, page_count, cmp_def,
+				      btree_path) != 0)
+		return -1;
+	if (vy_page_index_btree_read_meta(btree_path, root_offset, data_offset) != 0)
+		return -1;
+	return 0;
+}
+
+int
+vy_run_recover_page_info(struct vy_run *run, const char *dir,
+			 uint32_t space_id, uint32_t iid, struct key_def *cmp_def)
+{
+	assert(run->page_info == NULL);
+	struct xlog_cursor cursor;
 	char path[PATH_MAX];
 	vy_run_snprint_path(path, sizeof(path), dir,
 			    space_id, iid, run->id, VY_FILE_INDEX);
-
-	struct xlog_cursor cursor;
-	ERROR_INJECT_COUNTDOWN(ERRINJ_VY_RUN_RECOVER_COUNTDOWN, {
-		diag_set(ClientError, ER_INJECTION, "vinyl run recover");
-		goto fail;
-	});
 	if (xlog_cursor_open(&cursor, path))
 		goto fail;
 
@@ -1766,7 +1777,7 @@ vy_run_recover(struct vy_run *run, const char *dir,
 
 	/* Allocate buffer for page info. */
 	run->page_info = calloc(run->info.page_count,
-				      sizeof(struct vy_page_info));
+				sizeof(struct vy_page_info));
 	if (run->page_info == NULL) {
 		diag_set(OutOfMemory,
 			 run->info.page_count * sizeof(struct vy_page_info),
@@ -1811,13 +1822,77 @@ vy_run_recover(struct vy_run *run, const char *dir,
 
 	/* We don't need to keep metadata file open any longer. */
 	xlog_cursor_close(&cursor, false);
+	return 0;
 
+fail_close:
+	xlog_cursor_close(&cursor, false);
+fail:
+	diag_log();
+	say_error("failed to load `%s'", path);
+	return -1;
+}
+
+static int
+vy_run_recover_page_index(struct vy_run *run, const char *dir,
+			 uint32_t space_id, uint32_t iid, struct key_def *cmp_def)
+{
+	/* Initialize page index from the page index btree file. */
+	char btree_path[PATH_MAX];
+	vy_run_snprint_path(btree_path, sizeof(btree_path), dir,
+			    space_id, iid, run->id, VY_FILE_PAGE_INDEX);
+	uint64_t root_offset = 0;
+	uint64_t data_offset = 0;
+	if (vy_page_index_btree_read_meta(btree_path, &root_offset,
+					  &data_offset) != 0) {
+		if (errno != ENOENT || run->info.page_count == 0)
+			return -1;
+		diag_clear(diag_get());
+		say_warn("missing page index file `%s`, rebuilding", btree_path);
+		if (vy_run_build_page_index(run->page_info, run->info.page_count,
+					    btree_path, cmp_def,
+					    &root_offset, &data_offset) != 0)
+			return -1;
+	}
+	run->page_index_filepath = strdup(btree_path);
+	if (run->page_index_filepath == NULL) {
+		diag_set(OutOfMemory, strlen(btree_path) + 1, "strdup",
+				"page index filepath");
+		return -1;
+	}
+	vy_page_index_create(&run->page_index, &run->env->page_index_cache_env,
+			     cmp_def, root_offset, run->page_index_filepath,
+			     run->info.page_count);
+	run->page_index.btree.data_offset = data_offset;
+	return 0;
+}
+
+int
+vy_run_recover(struct vy_run *run, const char *dir,
+	       uint32_t space_id, uint32_t iid, struct key_def *cmp_def)
+{
+	ERROR_INJECT_COUNTDOWN(ERRINJ_VY_RUN_RECOVER_COUNTDOWN, {
+		diag_set(ClientError, ER_INJECTION, "vinyl run recover");
+		goto fail;
+	});
+
+	/* We need to account each page in run statistics. */
+	if (vy_run_recover_page_info(run, dir, space_id, iid, cmp_def) != 0)
+		return -1;
+
+	if (vy_run_recover_page_index(run, dir, space_id, iid, cmp_def) != 0)
+		goto fail;
+
+	if (vy_page_index_btree_open(&run->page_index.btree) != 0)
+		goto fail;
+
+	struct xlog_cursor cursor;
+	char path[PATH_MAX];
 	/* Prepare data file for reading. */
 	vy_run_snprint_path(path, sizeof(path), dir,
 			    space_id, iid, run->id, VY_FILE_RUN);
 	if (xlog_cursor_open(&cursor, path))
 		goto fail;
-	meta = &cursor.meta;
+	struct xlog_meta *meta = &cursor.meta;
 	if (strcmp(meta->filetype, XLOG_META_TYPE_RUN) != 0) {
 		diag_set(ClientError, ER_INVALID_XLOG_TYPE,
 			 XLOG_META_TYPE_RUN, meta->filetype);
@@ -1831,8 +1906,9 @@ fail_close:
 	xlog_cursor_close(&cursor, false);
 fail:
 	vy_run_clear(run);
-	diag_log();
-	say_error("failed to load `%s'", path);
+	/* TODO: think about logging */
+	//diag_log();
+	//say_error("failed to load `%s'", path);
 	return -1;
 }
 
@@ -1928,7 +2004,7 @@ vy_run_alloc_page_info(struct vy_run *run, uint32_t *page_info_capacity)
  * @retval  0 success
  * @retval -1 error, check diag
  */
-static int
+int
 vy_page_info_encode(const struct vy_page_info *page_info,
 		    struct xrow_header *xrow)
 {
@@ -2032,7 +2108,7 @@ vy_stmt_stat_encode(const struct vy_stmt_stat *stat, char *buf)
  * @retval  0 success
  * @retval -1 on error, check diag
  */
-static int
+static int MAYBE_UNUSED
 vy_run_info_encode(const struct vy_run_info *run_info,
 		   struct xrow_header *xrow)
 {
@@ -2106,8 +2182,8 @@ vy_run_info_encode(const struct vy_run_info *run_info,
  * Write run index to file.
  */
 static int
-vy_run_write_index(struct vy_run *run, const char *dirpath,
-		   uint32_t space_id, uint32_t iid)
+vy_run_write_index(struct vy_run *run, struct vy_page_info *page_info_array,
+		   const char *dirpath, uint32_t space_id, uint32_t iid)
 {
 	char path[PATH_MAX];
 	vy_run_snprint_path(path, sizeof(path), dirpath,
@@ -2135,10 +2211,9 @@ vy_run_write_index(struct vy_run *run, const char *dirpath,
 		goto fail_rollback;
 
 	for (uint32_t page_no = 0; page_no < run->info.page_count; ++page_no) {
-		struct vy_page_info *page_info = vy_run_page_info(run, page_no);
-		if (vy_page_info_encode(page_info, &xrow) < 0) {
+		struct vy_page_info *page_info = &page_info_array[page_no];
+		if (vy_page_info_encode(page_info, &xrow) < 0)
 			goto fail_rollback;
-		}
 		if (xlog_write_row(&index_xlog, &xrow) < 0)
 			goto fail_rollback;
 	}
@@ -2155,7 +2230,6 @@ vy_run_write_index(struct vy_run *run, const char *dirpath,
 	if (xlog_close(&index_xlog) != 0 ||
 	    xlog_materialize(&index_xlog) != 0)
 		goto fail;
-
 	return 0;
 
 fail_rollback:
@@ -2163,6 +2237,53 @@ fail_rollback:
 	xlog_tx_rollback(&index_xlog);
 fail:
 	xlog_discard(&index_xlog);
+	return -1;
+}
+
+/**
+ * Write page index B-tree to file.
+ */
+static int
+vy_run_write_btree(struct vy_run *run, struct vy_page_info *page_info_array,
+		   const char *dirpath, uint32_t space_id, uint32_t iid,
+		   struct key_def *cmp_def)
+{
+	char btree_path[PATH_MAX];
+	vy_run_snprint_path(btree_path, sizeof(btree_path), dirpath,
+			    space_id, iid, run->id, VY_FILE_PAGE_INDEX);
+
+	uint64_t root_offset = 0;
+	uint64_t data_offset = 0;
+	if (vy_run_build_page_index(page_info_array, run->info.page_count,
+				    btree_path, cmp_def,
+				    &root_offset, &data_offset) != 0)
+		goto fail;
+
+	/* (Re)initialize in-memory page index. */
+	if (run->page_index_filepath != NULL) {
+		vy_page_index_destroy(&run->page_index);
+		free(run->page_index_filepath);
+		run->page_index_filepath = NULL;
+	}
+	run->page_index_filepath = strdup(btree_path);
+	if (run->page_index_filepath == NULL) {
+		diag_set(OutOfMemory, strlen(btree_path) + 1, "strdup",
+			 "page index filepath");
+		goto fail;
+	}
+	vy_page_index_create(&run->page_index, &run->env->page_index_cache_env,
+			     cmp_def, root_offset,
+			     run->page_index_filepath, run->info.page_count);
+	run->page_index.btree.data_offset = data_offset;
+	if (vy_page_index_btree_open(&run->page_index.btree) != 0)
+		goto fail;
+	return 0;
+fail:
+	xlog_remove_file(btree_path, 0);
+	char index_path[PATH_MAX];
+	vy_run_snprint_path(index_path, sizeof(index_path), dirpath,
+			    space_id, iid, run->id, VY_FILE_INDEX);
+	xlog_remove_file(index_path, 0);
 	return -1;
 }
 
@@ -2417,8 +2538,12 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 	if (writer->bloom != NULL)
 		run->info.bloom = tuple_bloom_new(writer->bloom,
 						  writer->bloom_fpr);
-	if (vy_run_write_index(run, writer->dirpath,
+	if (vy_run_write_index(run, run->page_info, writer->dirpath,
 			       writer->space_id, writer->iid) != 0)
+		goto out;
+	if (vy_run_write_btree(run, run->page_info, writer->dirpath,
+			       writer->space_id, writer->iid,
+			       writer->cmp_def) != 0)
 		goto out;
 
 	vy_run_writer_destroy(writer);
@@ -2558,7 +2683,14 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 	vy_run_snprint_path(path, sizeof(path), dir,
 			    space_id, iid, run->id, VY_FILE_INDEX);
 	xlog_remove_file(path, 0);
-	if (vy_run_write_index(run, dir, space_id, iid) != 0)
+	/* The page index B-tree may survive if only .index is lost. */
+	vy_run_snprint_path(path, sizeof(path), dir,
+			    space_id, iid, run->id, VY_FILE_PAGE_INDEX);
+	xlog_remove_file(path, 0);
+	if (vy_run_write_index(run, run->page_info, dir, space_id, iid) != 0)
+		goto close_err;
+	if (vy_run_write_btree(run, run->page_info, dir, space_id, iid,
+			       cmp_def) != 0)
 		goto close_err;
 	return 0;
 close_err:

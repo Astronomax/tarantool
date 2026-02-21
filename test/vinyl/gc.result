@@ -62,7 +62,7 @@ while s.index.pk:stat().run_count > 1 do fiber.sleep(0.01) end -- wait for compa
 gc()
 ---
 ...
-assert(wait_gc(ls_data, 2))
+assert(wait_gc(ls_data, 3))
 ---
 - true
 ...

@@ -418,6 +418,7 @@ iproto_key_bit(unsigned char key)
 	 * VY_INDEX_RUN_INFO = 100
 	 * VY_INDEX_PAGE_INFO = 101
 	 * VY_RUN_ROW_INDEX = 102
+	 * VY_INDEX_BTREE = 103
 	 */								\
 									\
 	/** Non-final response type. */					\
@@ -444,6 +445,8 @@ enum iproto_type {
 	VY_INDEX_PAGE_INFO = 101,
 	/** Vinyl row index stored in .run file */
 	VY_RUN_ROW_INDEX = 102,
+	/** Vinyl page index btree metadata stored in .btree file. */
+	VY_INDEX_BTREE = 103,
 };
 
 /** IPROTO type name by code */
@@ -487,6 +490,8 @@ iproto_type_name(uint16_t type)
 		return "PAGEINFO";
 	case VY_RUN_ROW_INDEX:
 		return "ROWINDEX";
+	case VY_INDEX_BTREE:
+		return "BTREE";
 	default:
 		return NULL;
 	}
@@ -705,6 +710,25 @@ vy_row_index_key_name(enum vy_row_index_key key)
 		return NULL;
 	extern const char *vy_row_index_key_strs[];
 	return vy_row_index_key_strs[key];
+}
+
+#define VY_BTREE_KEYS(_)						\
+	_(DATA, 1)							\
+
+#define VY_BTREE_KEY_MEMBER(s, v) VY_BTREE_ ## s = v,
+
+enum vy_btree_key {
+	VY_BTREE_KEYS(VY_BTREE_KEY_MEMBER)
+	vy_btree_key_MAX
+};
+
+static inline const char *
+vy_btree_key_name(enum vy_btree_key key)
+{
+	if (key <= 0 || key >= vy_btree_key_MAX)
+		return NULL;
+	extern const char *vy_btree_key_strs[];
+	return vy_btree_key_strs[key];
 }
 
 /** Initialize the "IPROTO constants" subsystem. */

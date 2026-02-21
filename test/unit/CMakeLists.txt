@@ -514,6 +514,7 @@ create_unit_test(PREFIX vy_point_lookup
                          ${PROJECT_SOURCE_DIR}/src/box/vy_write_iterator.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_stmt.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_mem.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_page_index.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_run.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_range.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_tx.c
@@ -536,6 +537,7 @@ create_unit_test(PREFIX column_mask
 
 create_unit_test(PREFIX vy_write_iterator
                  SOURCES vy_write_iterator.c
+                         ${PROJECT_SOURCE_DIR}/src/box/vy_page_index.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_run.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_upsert.c
                          ${PROJECT_SOURCE_DIR}/src/box/vy_write_iterator.c
