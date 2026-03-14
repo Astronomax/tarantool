@@ -66,12 +66,14 @@ static const uint64_t vy_run_info_key_map = (1 << VY_RUN_INFO_MIN_KEY) |
 #define XLOG_META_TYPE_INDEX "INDEX"
 
 const char *vy_file_suffix[] = {
-	"index",			/* VY_FILE_INDEX */
-	"index" inprogress_suffix, 	/* VY_FILE_INDEX_INPROGRESS */
-	"run",				/* VY_FILE_RUN */
-	"run" inprogress_suffix, 	/* VY_FILE_RUN_INPROGRESS */
-	"btree",			/* VY_FILE_PAGE_INDEX */
-	"btree" inprogress_suffix,	/* VY_FILE_PAGE_INDEX_INPROGRESS */
+	"index",				/* VY_FILE_INDEX */
+	"index" inprogress_suffix, 		/* VY_FILE_INDEX_INPROGRESS */
+	"index_offsets",			/* VY_FILE_INDEX_OFFSETS */
+	"index_offsets" inprogress_suffix,	/* VY_FILE_INDEX_OFFSETS_INPROGRESS */
+	"run",					/* VY_FILE_RUN */
+	"run" inprogress_suffix, 		/* VY_FILE_RUN_INPROGRESS */
+	"btree",				/* VY_FILE_PAGE_INDEX */
+	"btree" inprogress_suffix,		/* VY_FILE_PAGE_INDEX_INPROGRESS */
 };
 
 /* sync run and index files very 16 MB */
@@ -194,6 +196,8 @@ vy_run_env_create(struct vy_run_env *env, int read_threads)
 	env->initial_join = false;
 	vy_page_index_cache_env_create(&env->page_index_cache_env,
 				       cord_slab_cache());
+	vy_page_info_cache_env_create(&env->page_info_cache_env,
+				      cord_slab_cache());
 }
 
 /**
@@ -207,6 +211,7 @@ vy_run_env_destroy(struct vy_run_env *env)
 	mempool_destroy(&env->read_task_pool);
 	tt_pthread_key_delete(env->zdctx_key);
 	vy_page_index_cache_env_destroy(&env->page_index_cache_env);
+	vy_page_info_cache_env_destroy(&env->page_info_cache_env);
 }
 
 /**
@@ -281,6 +286,7 @@ vy_page_info_new(void)
 	return page_info;
 }
 
+
 void
 vy_page_info_delete(struct vy_page_info *page_info)
 {
@@ -290,13 +296,20 @@ vy_page_info_delete(struct vy_page_info *page_info)
 	free(page_info);
 }
 
+void
+vy_page_info_copy(struct vy_page_info *dst, struct vy_page_info *src) {
+
+	memcpy(dst, src, sizeof(struct vy_page_info));
+	dst->min_key = mp_dup(dst->min_key);
+}
+
 struct vy_page_info *
-vy_page_info_copy(struct vy_page_info *page_info) {
-	struct vy_page_info *copy = vy_page_info_new();
-	if (copy == NULL)
+vy_page_info_dup(struct vy_page_info *page_info) {
+	struct vy_page_info *dup = vy_page_info_new();
+	if (dup == NULL)
 		return NULL;
-	copy->min_key = mp_dup(page_info->min_key);
-	return copy;
+	vy_page_info_copy(dup, page_info);
+	return dup;
 }
 
 int
@@ -340,18 +353,8 @@ vy_run_new(struct vy_run_env *env, int64_t id)
 static void
 vy_run_clear(struct vy_run *run)
 {
-	if (run->page_index_filepath != NULL) {
+	if (run->page_index.page_count > 0)
 		vy_page_index_destroy(&run->page_index);
-		free(run->page_index_filepath);
-		run->page_index_filepath = NULL;
-	}
-	if (run->page_info != NULL) {
-		uint32_t page_no;
-		for (page_no = 0; page_no < run->info.page_count; ++page_no)
-			vy_page_info_destroy(run->page_info + page_no);
-		free(run->page_info);
-	}
-	run->page_info = NULL;
 	run->page_index_size = 0;
 	run->info.page_count = 0;
 	if (run->info.bloom != NULL) {
@@ -379,6 +382,21 @@ size_t
 vy_run_bloom_size(struct vy_run *run)
 {
 	return run->info.bloom == NULL ? 0 : tuple_bloom_size(run->info.bloom);
+}
+
+int
+vy_run_page_info(struct vy_run *run, uint32_t pos, struct vy_page_info *result)
+{
+	assert(pos < run->info.page_count);
+	struct vy_page_index_array_iterator it;
+	if (vy_page_index_get_page(&run->page_index, pos, &it) != 0)
+		return -1;
+	struct vy_page_info *page_info =
+		vy_page_index_array_iterator_get(&it);
+	assert(page_info != NULL);
+	vy_page_info_copy(result, page_info);
+	vy_page_index_array_iterator_close(&it);
+	return 0;
 }
 
 struct vy_slice *
@@ -677,6 +695,10 @@ vy_run_info_decode(struct vy_run_info *run_info,
 			break;
 		case VY_RUN_INFO_STMT_STAT:
 			vy_stmt_stat_decode(&run_info->stmt_stat, &pos);
+			break;
+		case VY_RUN_INFO_INDEX_FORMAT_VERSION:
+			run_info->index_format_version =
+				mp_decode_uint(&pos);
 			break;
 		default:
 			mp_next(&pos); /* unknown key, ignore */
@@ -1003,7 +1025,16 @@ vy_run_iterator_load_page(struct vy_run_iterator *itr, uint32_t page_no,
 	struct vy_slice *slice = itr->slice;
 	struct vy_run_env *env = slice->run->env;
 
-	/* Check cache */
+	/* Keep page_info_it in sync with the page_no. */
+	if (itr->page_info_it.page_no != page_no) {
+		vy_page_index_array_iterator_close(&itr->page_info_it);
+		if (vy_page_index_get_page(&slice->run->page_index,
+					   page_no,
+					   &itr->page_info_it) != 0)
+			return -1;
+	}
+
+	/* Check if the page data is already cached. */
 	struct vy_page *page = NULL;
 	if (itr->curr_page != NULL &&
 	    itr->curr_page->page_no == page_no) {
@@ -1022,9 +1053,8 @@ vy_run_iterator_load_page(struct vy_run_iterator *itr, uint32_t page_no,
 		*result = page;
 		return 0;
 	}
-
-	/* Allocate buffers */
-	struct vy_page_info *page_info = vy_run_page_info(slice->run, page_no);
+	struct vy_page_info *page_info =
+		vy_page_index_array_iterator_get(&itr->page_info_it);
 	page = vy_page_new(page_info);
 	if (page == NULL)
 		return -1;
@@ -1132,8 +1162,20 @@ vy_run_iterator_search(struct vy_run_iterator *itr,
 	if (rc != 0)
 		return rc;
 	if (pos->pos_in_page == page->row_count) {
-		pos->page_no++;
-		pos->pos_in_page = 0;
+		if (iterator_type == ITER_LE || iterator_type == ITER_LT) {
+			/*
+			 * For reverse iterators, keep {page_no, row_count}.
+			 * next_pos will decrement pos_in_page to the last
+			 * row on this page.
+			 */
+		} else {
+			pos->page_no++;
+			if (vy_page_index_array_iterator_next(
+			    &itr->slice->run->page_index.page_info,
+			    &itr->page_info_it) != 0)
+				return -1;
+			pos->pos_in_page = 0;
+		}
 	} else {
 		*equal_key = equal_in_page;
 	}
@@ -1154,16 +1196,23 @@ vy_run_iterator_next_pos(struct vy_run_iterator *itr,
 {
 	struct vy_run *run = itr->slice->run;
 	*pos = itr->curr_pos;
+	assert(itr->page_info_it.page_no == pos->page_no);
 	if (iterator_type == ITER_LE || iterator_type == ITER_LT) {
-		assert(pos->page_no <= run->info.page_count);
+		assert(pos->page_no < run->info.page_count);
 		if (pos->pos_in_page > 0) {
 			pos->pos_in_page--;
 		} else {
 			if (pos->page_no == 0)
 				return 1;
 			pos->page_no--;
+			if (vy_page_index_array_iterator_prev(
+			    &run->page_index.page_info,
+			    &itr->page_info_it) != 0)
+				return -1;
+			assert(pos->page_no == itr->page_info_it.page_no);
 			struct vy_page_info *page_info =
-				vy_run_page_info(run, pos->page_no);
+				vy_page_index_array_iterator_get(
+					&itr->page_info_it);
 			assert(page_info->row_count > 0);
 			pos->pos_in_page = page_info->row_count - 1;
 		}
@@ -1172,11 +1221,15 @@ vy_run_iterator_next_pos(struct vy_run_iterator *itr,
 		       iterator_type == ITER_EQ);
 		assert(pos->page_no < run->info.page_count);
 		struct vy_page_info *page_info =
-			vy_run_page_info(run, pos->page_no);
+			vy_page_index_array_iterator_get(
+				&itr->page_info_it);
 		assert(page_info->row_count > 0);
 		pos->pos_in_page++;
 		if (pos->pos_in_page >= page_info->row_count) {
 			pos->page_no++;
+			if (vy_page_index_array_iterator_next(
+			    &run->page_index.page_info, &itr->page_info_it) != 0)
+				return -1;
 			pos->pos_in_page = 0;
 			if (pos->page_no == run->info.page_count)
 				return 1;
@@ -1240,6 +1293,15 @@ vy_run_iterator_find_lsn(struct vy_run_iterator *itr, struct vy_entry *ret)
 			itr->curr = test;
 			itr->curr_pos = test_pos;
 		}
+		/* Restore position. */
+		if (itr->page_info_it.page_no != itr->curr_pos.page_no) {
+			vy_page_index_array_iterator_close(
+				&itr->page_info_it);
+			if (vy_page_index_get_page(&slice->run->page_index,
+						   itr->curr_pos.page_no,
+						   &itr->page_info_it) != 0)
+				return -1;
+		}
 	}
 	/* Check if the result is within the slice boundaries. */
 	if (itr->iterator_type == ITER_LE || itr->iterator_type == ITER_LT) {
@@ -1289,9 +1351,23 @@ vy_run_iterator_do_seek(struct vy_run_iterator *itr,
 		if (rc != 0)
 			return rc;
 	} else if (iterator_type == ITER_LE) {
-		itr->curr_pos = end_pos;
+		if (run->info.page_count == 0)
+			return 1;
+		uint32_t last = run->info.page_count - 1;
+		vy_page_index_array_iterator_close(&itr->page_info_it);
+		if (vy_page_index_get_page(&run->page_index, last,
+					   &itr->page_info_it) != 0)
+			return -1;
+		struct vy_page_info *page_info =
+			vy_page_index_array_iterator_get(&itr->page_info_it);
+		itr->curr_pos.page_no = last;
+		itr->curr_pos.pos_in_page = page_info->row_count;
 	} else {
 		assert(iterator_type == ITER_GE);
+		vy_page_index_array_iterator_close(&itr->page_info_it);
+		if (vy_page_index_get_page(&run->page_index, 0,
+					   &itr->page_info_it) != 0)
+			return -1;
 		itr->curr_pos.page_no = 0;
 		itr->curr_pos.pos_in_page = 0;
 	}
@@ -1476,6 +1552,7 @@ vy_run_iterator_open(struct vy_run_iterator *itr,
 	itr->curr_pos.page_no = slice->run->info.page_count;
 	itr->curr_page = NULL;
 	itr->prev_page = NULL;
+	itr->page_info_it = vy_page_index_array_invalid_iterator();
 	itr->search_started = false;
 
 	/*
@@ -1548,9 +1625,26 @@ vy_run_iterator_next_lsn(struct vy_run_iterator *itr, struct vy_entry *ret)
 	assert(itr->curr_pos.page_no < itr->slice->run->info.page_count);
 
 	struct vy_run_iterator_pos next_pos;
-next:
-	if (vy_run_iterator_next_pos(itr, ITER_GE, &next_pos) != 0)
+next:;
+	int rc = vy_run_iterator_next_pos(itr, ITER_GE, &next_pos);
+	if (rc < 0)
+		return -1;
+	if (rc > 0) {
+		/*
+		 * EOF. next_pos may have advanced page_info_it
+		 * past the last page. Restore it.
+		 */
+		if (itr->page_info_it.page_no != itr->curr_pos.page_no) {
+			vy_page_index_array_iterator_close(
+				&itr->page_info_it);
+			if (vy_page_index_get_page(
+			    &itr->slice->run->page_index,
+			    itr->curr_pos.page_no,
+			    &itr->page_info_it) != 0)
+				return -1;
+		}
 		return 0;
+	}
 
 	struct vy_entry next;
 	if (vy_run_iterator_read(itr, next_pos, &next) != 0)
@@ -1558,6 +1652,20 @@ next:
 
 	if (vy_entry_compare(itr->curr, next, itr->cmp_def) != 0) {
 		tuple_unref(next.stmt);
+		/*
+		 * The forward step moved page_info_it past curr_pos.
+		 * Restore it so that the caller can use iterator_prev
+		 * without sync checks.
+		 */
+		if (itr->page_info_it.page_no != itr->curr_pos.page_no) {
+			vy_page_index_array_iterator_close(
+				&itr->page_info_it);
+			if (vy_page_index_get_page(
+			    &itr->slice->run->page_index,
+			    itr->curr_pos.page_no,
+			    &itr->page_info_it) != 0)
+				return -1;
+		}
 		return 0;
 	}
 
@@ -1678,8 +1786,10 @@ vy_run_estimate_key_at(struct vy_run *run, struct vy_entry begin,
 		*result = NULL;
 		return 0;
 	}
-	struct vy_page_info *page_info = vy_run_page_info(run, page_no);
-	*result = page_info->min_key;
+	struct vy_page_info page_info;
+	if (vy_run_page_info(run, page_no, &page_info) != 0)
+		return -1;
+	*result = page_info.min_key;
 	return 0;
 }
 
@@ -1697,41 +1807,13 @@ vy_run_acct_page(struct vy_run *run, struct vy_page_info *page)
 	run->count.pages++;
 }
 
-int
-vy_run_build_page_index(struct vy_page_info *page_info_array,
-			uint32_t page_count, const char *btree_path,
-			struct key_def *cmp_def,
-			uint64_t *root_offset, uint64_t *data_offset)
-{
-	struct vy_page_index_entry *entries = region_alloc(
-		&fiber()->gc, (size_t)page_count * sizeof(*entries));
-	if (entries == NULL) {
-		diag_set(OutOfMemory, (size_t)page_count *
-			 sizeof(*entries), "region_alloc",
-			 "page index entries");
-		return -1;
-	}
-	for (uint32_t page_no = 0; page_no < page_count; page_no++) {
-		entries[page_no].idx = (int32_t)page_no;
-		entries[page_no].min_key = page_info_array[page_no].min_key;
-		entries[page_no].min_key_hint =
-			page_info_array[page_no].min_key_hint;
-	}
-	struct vy_page_index_btree built = {0};
-	built.fd = -1;
-	if (vy_page_index_btree_build(&built, entries, page_count, cmp_def,
-				      btree_path) != 0)
-		return -1;
-	if (vy_page_index_btree_read_meta(btree_path, root_offset, data_offset) != 0)
-		return -1;
-	return 0;
-}
 
 int
 vy_run_recover_page_info(struct vy_run *run, const char *dir,
-			 uint32_t space_id, uint32_t iid, struct key_def *cmp_def)
+			 uint32_t space_id, uint32_t iid, struct key_def *cmp_def,
+			 struct vy_page_info **page_info_array)
 {
-	assert(run->page_info == NULL);
+	*page_info_array = NULL;
 	struct xlog_cursor cursor;
 	char path[PATH_MAX];
 	vy_run_snprint_path(path, sizeof(path), dir,
@@ -1748,7 +1830,6 @@ vy_run_recover_page_info(struct vy_run *run, const char *dir,
 
 	/* Read run header. */
 	struct xrow_header xrow;
-	/* all rows should be in one tx */
 	int rc = xlog_cursor_next_tx(&cursor);
 
 	if (rc != 0) {
@@ -1774,11 +1855,11 @@ vy_run_recover_page_info(struct vy_run *run, const char *dir,
 
 	if (vy_run_info_decode(&run->info, &xrow, path) != 0)
 		goto fail_close;
-
+	
 	/* Allocate buffer for page info. */
-	run->page_info = calloc(run->info.page_count,
+	*page_info_array = calloc(run->info.page_count,
 				sizeof(struct vy_page_info));
-	if (run->page_info == NULL) {
+	if (*page_info_array == NULL) {
 		diag_set(OutOfMemory,
 			 run->info.page_count * sizeof(struct vy_page_info),
 			 "malloc", "struct vy_page_info");
@@ -1786,17 +1867,24 @@ vy_run_recover_page_info(struct vy_run *run, const char *dir,
 	}
 
 	for (uint32_t page_no = 0; page_no < run->info.page_count; page_no++) {
+		/*
+		 * Old format (index_format_version == 0): all page
+		 * info rows in one transaction with the run header.
+		 * New format (index_format_version >= 1): each page
+		 * info row in its own transaction.
+		 * Try reading the next row first; if the current
+		 * transaction is exhausted, start a new one.
+		 */
 		int rc = xlog_cursor_next_row(&cursor, &xrow);
+		if (rc > 0) {
+			rc = xlog_cursor_next_tx(&cursor);
+			if (rc == 0)
+				rc = xlog_cursor_next_row(&cursor, &xrow);
+		}
 		if (rc != 0) {
-			if (rc > 0) {
-				/** To few pages in file */
+			if (rc > 0)
 				diag_set(ClientError, ER_INVALID_INDEX_FILE,
 					 path, "Unexpected end of file");
-			}
-			/*
-			 * Limit the count of pages to
-			 * successfully created pages.
-			 */
 			run->info.page_count = page_no;
 			goto fail_close;
 		}
@@ -1808,12 +1896,8 @@ vy_run_recover_page_info(struct vy_run *run, const char *dir,
 					    (unsigned)xrow.type));
 			goto fail_close;
 		}
-		struct vy_page_info *page = run->page_info + page_no;
+		struct vy_page_info *page = *page_info_array + page_no;
 		if (vy_page_info_decode(page, &xrow, cmp_def, path) < 0) {
-			/**
-			 * Limit the count of pages to successfully
-			 * created pages
-			 */
 			run->info.page_count = page_no;
 			goto fail_close;
 		}
@@ -1827,6 +1911,12 @@ vy_run_recover_page_info(struct vy_run *run, const char *dir,
 fail_close:
 	xlog_cursor_close(&cursor, false);
 fail:
+	if (*page_info_array != NULL) {
+		for (uint32_t i = 0; i < run->info.page_count; i++)
+			vy_page_info_destroy(&(*page_info_array)[i]);
+		free(*page_info_array);
+		*page_info_array = NULL;
+	}
 	diag_log();
 	say_error("failed to load `%s'", path);
 	return -1;
@@ -1834,37 +1924,30 @@ fail:
 
 static int
 vy_run_recover_page_index(struct vy_run *run, const char *dir,
-			 uint32_t space_id, uint32_t iid, struct key_def *cmp_def)
+			  uint32_t space_id, uint32_t iid, struct key_def *cmp_def,
+			  struct vy_page_info *page_info_array)
 {
-	/* Initialize page index from the page index btree file. */
-	char btree_path[PATH_MAX];
-	vy_run_snprint_path(btree_path, sizeof(btree_path), dir,
+	char index_path[PATH_MAX];
+	vy_run_snprint_path(index_path, sizeof(index_path), dir,
+			    space_id, iid, run->id, VY_FILE_INDEX);
+	char index_btree_path[PATH_MAX];
+	vy_run_snprint_path(index_btree_path, sizeof(index_btree_path), dir,
 			    space_id, iid, run->id, VY_FILE_PAGE_INDEX);
-	uint64_t root_offset = 0;
-	uint64_t data_offset = 0;
-	if (vy_page_index_btree_read_meta(btree_path, &root_offset,
-					  &data_offset) != 0) {
-		if (errno != ENOENT || run->info.page_count == 0)
-			return -1;
-		diag_clear(diag_get());
-		say_warn("missing page index file `%s`, rebuilding", btree_path);
-		if (vy_run_build_page_index(run->page_info, run->info.page_count,
-					    btree_path, cmp_def,
-					    &root_offset, &data_offset) != 0)
-			return -1;
-	}
-	run->page_index_filepath = strdup(btree_path);
-	if (run->page_index_filepath == NULL) {
-		diag_set(OutOfMemory, strlen(btree_path) + 1, "strdup",
-				"page index filepath");
-		return -1;
-	}
-	vy_page_index_create(&run->page_index, &run->env->page_index_cache_env,
-			     cmp_def, root_offset, run->page_index_filepath,
-			     run->info.page_count);
-	run->page_index.btree.data_offset = data_offset;
-	return 0;
+	char index_offsets_path[PATH_MAX];
+	vy_run_snprint_path(index_offsets_path, sizeof(index_offsets_path), dir,
+			    space_id, iid, run->id, VY_FILE_INDEX_OFFSETS);
+	return vy_page_index_recover(&run->page_index,
+				    index_path, index_btree_path,
+				    index_offsets_path,
+				    &run->env->page_index_cache_env,
+				    &run->env->page_info_cache_env,
+				    cmp_def,
+				    page_info_array, run->info.page_count);
 }
+
+static int
+vy_run_write_index(struct vy_run *run, struct vy_page_info *page_info_array,
+		   const char *dirpath, uint32_t space_id, uint32_t iid);
 
 int
 vy_run_recover(struct vy_run *run, const char *dir,
@@ -1875,19 +1958,51 @@ vy_run_recover(struct vy_run *run, const char *dir,
 		goto fail;
 	});
 
+	struct vy_page_info *page_info_array = NULL;
 	/* We need to account each page in run statistics. */
-	if (vy_run_recover_page_info(run, dir, space_id, iid, cmp_def) != 0)
+	if (vy_run_recover_page_info(run, dir, space_id, iid, cmp_def, &page_info_array) != 0)
 		return -1;
 
-	if (vy_run_recover_page_index(run, dir, space_id, iid, cmp_def) != 0)
-		goto fail;
+	if (run->info.index_format_version == 0) {
+		say_info("upgrading index file for run %lld",
+			 (long long)run->id);
+		run->info.index_format_version = 1;
+		char old_path[PATH_MAX];
+		vy_run_snprint_path(old_path, sizeof(old_path), dir,
+				    space_id, iid, run->id, VY_FILE_INDEX);
+		if (unlink(old_path) != 0) {
+			diag_set(SystemError, "failed to unlink %s",
+				 old_path);
+			for (uint32_t i = 0; i < run->info.page_count; i++)
+				vy_page_info_destroy(&page_info_array[i]);
+			free(page_info_array);
+			return -1;
+		}
+		if (vy_run_write_index(run, page_info_array,
+				       dir, space_id, iid) != 0) {
+			for (uint32_t i = 0; i < run->info.page_count; i++)
+				vy_page_info_destroy(&page_info_array[i]);
+			free(page_info_array);
+			return -1;
+		}
+	}
 
-	if (vy_page_index_btree_open(&run->page_index.btree) != 0)
-		goto fail;
+	if (vy_run_recover_page_index(run, dir, space_id, iid, cmp_def,
+				     page_info_array) != 0) {
+		for (uint32_t i = 0; i < run->info.page_count; i++)
+			vy_page_info_destroy(&page_info_array[i]);
+		free(page_info_array);
+		return -1;
+	}
 
-	struct xlog_cursor cursor;
-	char path[PATH_MAX];
+	for (uint32_t i = 0; i < run->info.page_count; i++)
+		vy_page_info_destroy(&page_info_array[i]);
+	free(page_info_array);
+	page_info_array = NULL;
+
 	/* Prepare data file for reading. */
+	char path[PATH_MAX];
+	struct xlog_cursor cursor;
 	vy_run_snprint_path(path, sizeof(path), dir,
 			    space_id, iid, run->id, VY_FILE_RUN);
 	if (xlog_cursor_open(&cursor, path))
@@ -1905,6 +2020,11 @@ vy_run_recover(struct vy_run *run, const char *dir,
 fail_close:
 	xlog_cursor_close(&cursor, false);
 fail:
+	if (page_info_array != NULL) {
+		for (uint32_t i = 0; i < run->info.page_count; i++)
+			vy_page_info_destroy(&page_info_array[i]);
+		free(page_info_array);
+	}
 	vy_run_clear(run);
 	/* TODO: think about logging */
 	//diag_log();
@@ -1976,18 +2096,19 @@ vy_row_index_encode(const uint32_t *row_index, uint32_t row_count,
  * Helper to extend run page info array
  */
 static inline int
-vy_run_alloc_page_info(struct vy_run *run, uint32_t *page_info_capacity)
+vy_run_alloc_page_info(struct vy_page_info **page_info_ptr,
+		       uint32_t *page_info_capacity)
 {
 	uint32_t cap = *page_info_capacity > 0 ?
 		       *page_info_capacity * 2 : 16;
-	struct vy_page_info *page_info = realloc(run->page_info,
+	struct vy_page_info *page_info = realloc(*page_info_ptr,
 					cap * sizeof(*page_info));
 	if (page_info == NULL) {
 		diag_set(OutOfMemory, cap * sizeof(*page_info),
 			 "realloc", "struct vy_page_info");
 		return -1;
 	}
-	run->page_info = page_info;
+	*page_info_ptr = page_info;
 	*page_info_capacity = cap;
 	return 0;
 }
@@ -2120,7 +2241,7 @@ vy_run_info_encode(const struct vy_run_info *run_info,
 	mp_next(&tmp);
 	size_t max_key_size = tmp - run_info->max_key;
 
-	uint32_t key_count = 6;
+	uint32_t key_count = 7;
 	uint32_t bloom_key = 0;
 	if (run_info->bloom != NULL) {
 		key_count++;
@@ -2137,6 +2258,8 @@ vy_run_info_encode(const struct vy_run_info *run_info,
 		mp_sizeof_uint(run_info->max_lsn);
 	size += mp_sizeof_uint(VY_RUN_INFO_PAGE_COUNT) +
 		mp_sizeof_uint(run_info->page_count);
+	size += mp_sizeof_uint(VY_RUN_INFO_INDEX_FORMAT_VERSION) +
+		mp_sizeof_uint(1);
 	if (run_info->bloom != NULL)
 		size += mp_sizeof_uint(bloom_key) +
 			tuple_bloom_size(run_info->bloom);
@@ -2164,6 +2287,8 @@ vy_run_info_encode(const struct vy_run_info *run_info,
 	pos = mp_encode_uint(pos, run_info->max_lsn);
 	pos = mp_encode_uint(pos, VY_RUN_INFO_PAGE_COUNT);
 	pos = mp_encode_uint(pos, run_info->page_count);
+	pos = mp_encode_uint(pos, VY_RUN_INFO_INDEX_FORMAT_VERSION);
+	pos = mp_encode_uint(pos, 1);
 	if (run_info->bloom != NULL) {
 		pos = mp_encode_uint(pos, bloom_key);
 		pos = tuple_bloom_encode(run_info->bloom, pos);
@@ -2198,29 +2323,35 @@ vy_run_write_index(struct vy_run *run, struct vy_page_info *page_info_array,
 	struct xlog_opts opts = xlog_opts_default;
 	opts.rate_limit = run->env->snap_io_rate_limit;
 	opts.sync_interval = VY_RUN_SYNC_INTERVAL;
+	opts.no_compression = true;
 	if (xlog_create(&index_xlog, path, 0, &meta, &opts) < 0)
 		return -1;
 
-	xlog_tx_begin(&index_xlog);
 	struct region *region = &fiber()->gc;
 	size_t mem_used = region_used(region);
-
 	struct xrow_header xrow;
+
+	xlog_tx_begin(&index_xlog);
 	if (vy_run_info_encode(&run->info, &xrow) != 0 ||
 	    xlog_write_row(&index_xlog, &xrow) < 0)
 		goto fail_rollback;
+	region_truncate(region, mem_used);
+	if (xlog_tx_commit(&index_xlog) < 0 ||
+	    xlog_flush(&index_xlog) < 0)
+		goto fail;
 
 	for (uint32_t page_no = 0; page_no < run->info.page_count; ++page_no) {
 		struct vy_page_info *page_info = &page_info_array[page_no];
+		xlog_tx_begin(&index_xlog);
 		if (vy_page_info_encode(page_info, &xrow) < 0)
 			goto fail_rollback;
 		if (xlog_write_row(&index_xlog, &xrow) < 0)
 			goto fail_rollback;
+		region_truncate(region, mem_used);
+		if (xlog_tx_commit(&index_xlog) < 0 ||
+		    xlog_flush(&index_xlog) < 0)
+			goto fail;
 	}
-
-	region_truncate(region, mem_used);
-	if (xlog_tx_commit(&index_xlog) < 0)
-		goto fail;
 
 	ERROR_INJECT(ERRINJ_VY_INDEX_FILE_RENAME, {
 		diag_set(ClientError, ER_INJECTION, "vinyl index file rename");
@@ -2240,52 +2371,6 @@ fail:
 	return -1;
 }
 
-/**
- * Write page index B-tree to file.
- */
-static int
-vy_run_write_btree(struct vy_run *run, struct vy_page_info *page_info_array,
-		   const char *dirpath, uint32_t space_id, uint32_t iid,
-		   struct key_def *cmp_def)
-{
-	char btree_path[PATH_MAX];
-	vy_run_snprint_path(btree_path, sizeof(btree_path), dirpath,
-			    space_id, iid, run->id, VY_FILE_PAGE_INDEX);
-
-	uint64_t root_offset = 0;
-	uint64_t data_offset = 0;
-	if (vy_run_build_page_index(page_info_array, run->info.page_count,
-				    btree_path, cmp_def,
-				    &root_offset, &data_offset) != 0)
-		goto fail;
-
-	/* (Re)initialize in-memory page index. */
-	if (run->page_index_filepath != NULL) {
-		vy_page_index_destroy(&run->page_index);
-		free(run->page_index_filepath);
-		run->page_index_filepath = NULL;
-	}
-	run->page_index_filepath = strdup(btree_path);
-	if (run->page_index_filepath == NULL) {
-		diag_set(OutOfMemory, strlen(btree_path) + 1, "strdup",
-			 "page index filepath");
-		goto fail;
-	}
-	vy_page_index_create(&run->page_index, &run->env->page_index_cache_env,
-			     cmp_def, root_offset,
-			     run->page_index_filepath, run->info.page_count);
-	run->page_index.btree.data_offset = data_offset;
-	if (vy_page_index_btree_open(&run->page_index.btree) != 0)
-		goto fail;
-	return 0;
-fail:
-	xlog_remove_file(btree_path, 0);
-	char index_path[PATH_MAX];
-	vy_run_snprint_path(index_path, sizeof(index_path), dirpath,
-			    space_id, iid, run->id, VY_FILE_INDEX);
-	xlog_remove_file(index_path, 0);
-	return -1;
-}
 
 int
 vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
@@ -2313,7 +2398,6 @@ vy_run_writer_create(struct vy_run_writer *writer, struct vy_run *run,
 		    4096 * sizeof(uint32_t));
 	run->info.min_lsn = INT64_MAX;
 	run->info.max_lsn = -1;
-	assert(run->page_info == NULL);
 	return 0;
 }
 
@@ -2358,7 +2442,8 @@ vy_run_writer_start_page(struct vy_run_writer *writer,
 {
 	struct vy_run *run = writer->run;
 	if (run->info.page_count >= writer->page_info_capacity &&
-	    vy_run_alloc_page_info(run, &writer->page_info_capacity) != 0)
+	    vy_run_alloc_page_info(&writer->page_info,
+				   &writer->page_info_capacity) != 0)
 		return -1;
 	const char *key = vy_stmt_is_key(first_entry.stmt) ?
 			  tuple_data(first_entry.stmt) :
@@ -2372,7 +2457,7 @@ vy_run_writer_start_page(struct vy_run_writer *writer,
 		assert(run->info.min_key == NULL);
 		run->info.min_key = mp_dup(key);
 	}
-	struct vy_page_info *page = run->page_info + run->info.page_count;
+	struct vy_page_info *page = writer->page_info + run->info.page_count;
 	vy_page_info_create(page, writer->data_xlog.offset, key,
 			    writer->cmp_def);
 	run->info.page_count++;
@@ -2399,7 +2484,7 @@ vy_run_writer_write_to_page(struct vy_run_writer *writer, struct vy_entry entry)
 	writer->last = entry;
 	vy_stmt_ref_if_possible(entry.stmt);
 	struct vy_run *run = writer->run;
-	struct vy_page_info *page = run->page_info + run->info.page_count - 1;
+	struct vy_page_info *page = writer->page_info + run->info.page_count - 1;
 	uint32_t *offset = (uint32_t *)ibuf_alloc(&writer->row_index_buf,
 						  sizeof(uint32_t));
 	if (offset == NULL) {
@@ -2428,7 +2513,7 @@ vy_run_writer_end_page(struct vy_run_writer *writer)
 {
 	struct vy_run *run = writer->run;
 	assert(run->info.page_count > 0);
-	struct vy_page_info *page = run->page_info + run->info.page_count - 1;
+	struct vy_page_info *page = writer->page_info + run->info.page_count - 1;
 
 	assert(page->row_count > 0);
 	assert(ibuf_used(&writer->row_index_buf) ==
@@ -2484,6 +2569,12 @@ out:
 static void
 vy_run_writer_destroy(struct vy_run_writer *writer)
 {
+	if (writer->page_info != NULL) {
+		for (uint32_t i = 0; i < writer->run->info.page_count; i++)
+			vy_page_info_destroy(&writer->page_info[i]);
+		free(writer->page_info);
+		writer->page_info = NULL;
+	}
 	if (writer->last.stmt != NULL)
 		vy_stmt_unref_if_possible(writer->last.stmt);
 	if (xlog_is_open(&writer->data_xlog))
@@ -2538,12 +2629,43 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 	if (writer->bloom != NULL)
 		run->info.bloom = tuple_bloom_new(writer->bloom,
 						  writer->bloom_fpr);
-	if (vy_run_write_index(run, run->page_info, writer->dirpath,
+	if (vy_run_write_index(run, writer->page_info, writer->dirpath,
 			       writer->space_id, writer->iid) != 0)
 		goto out;
-	if (vy_run_write_btree(run, run->page_info, writer->dirpath,
-			       writer->space_id, writer->iid,
-			       writer->cmp_def) != 0)
+	struct vy_page_index_entry *entries = region_alloc(
+		&fiber()->gc, (size_t)run->info.page_count * sizeof(*entries));
+	if (entries == NULL) {
+		diag_set(OutOfMemory, (size_t)run->info.page_count *
+			 sizeof(*entries), "region_alloc",
+			 "page index entries");
+		goto out;
+	}
+	for (uint32_t page_no = 0; page_no < run->info.page_count; page_no++) {
+		entries[page_no].idx = (int32_t)page_no;
+		entries[page_no].min_key = writer->page_info[page_no].min_key;
+		entries[page_no].min_key_hint =
+			writer->page_info[page_no].min_key_hint;
+	}
+
+	char index_path[PATH_MAX];
+	vy_run_snprint_path(index_path, sizeof(index_path), writer->dirpath,
+			    writer->space_id, writer->iid, run->id,
+			    VY_FILE_INDEX);
+	char index_btree_path[PATH_MAX];
+	vy_run_snprint_path(index_btree_path, sizeof(index_btree_path),
+			    writer->dirpath, writer->space_id, writer->iid,
+			    run->id, VY_FILE_PAGE_INDEX);
+	char index_offsets_path[PATH_MAX];
+	vy_run_snprint_path(index_offsets_path, sizeof(index_offsets_path),
+			    writer->dirpath, writer->space_id, writer->iid,
+			    run->id, VY_FILE_INDEX_OFFSETS);
+	if (vy_page_index_write(&run->page_index, writer->page_info,
+				entries, run->info.page_count,
+				index_path, index_btree_path,
+				index_offsets_path,
+				&run->env->page_index_cache_env,
+				&run->env->page_info_cache_env,
+				writer->cmp_def) != 0)
 		goto out;
 
 	vy_run_writer_destroy(writer);
@@ -2566,7 +2688,7 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 		     struct tuple_format *format, const struct index_opts *opts)
 {
 	assert(run->info.bloom == NULL);
-	assert(run->page_info == NULL);
+	struct vy_page_info *page_info_array = NULL;
 	struct region *region = &fiber()->gc;
 	size_t mem_used = region_used(region);
 
@@ -2602,7 +2724,8 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 		next_page_offset = xlog_cursor_pos(&cursor);
 
 		if (run->info.page_count == page_info_capacity &&
-		    vy_run_alloc_page_info(run, &page_info_capacity) != 0)
+		    vy_run_alloc_page_info(&page_info_array,
+					  &page_info_capacity) != 0)
 			goto close_err;
 		uint32_t page_row_count = 0;
 		uint64_t page_row_index_offset = 0;
@@ -2646,7 +2769,7 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 			row_offset = xlog_cursor_tx_pos(&cursor);
 		}
 		struct vy_page_info *info;
-		info = run->page_info + run->info.page_count;
+		info = page_info_array + run->info.page_count;
 		vy_page_info_create(info, page_offset, page_min_key, cmp_def);
 		info->row_count = page_row_count;
 		info->size = next_page_offset - page_offset;
@@ -2679,21 +2802,54 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 		bloom_builder = NULL;
 	}
 
-	/* New run index is ready for write, unlink old file if exists */
-	vy_run_snprint_path(path, sizeof(path), dir,
+	/* New run index is ready for write, unlink old files if exist */
+	char index_path[PATH_MAX];
+	vy_run_snprint_path(index_path, sizeof(index_path), dir,
 			    space_id, iid, run->id, VY_FILE_INDEX);
-	xlog_remove_file(path, 0);
-	/* The page index B-tree may survive if only .index is lost. */
-	vy_run_snprint_path(path, sizeof(path), dir,
+	xlog_remove_file(index_path, 0);
+	char index_btree_path[PATH_MAX];
+	vy_run_snprint_path(index_btree_path, sizeof(index_btree_path), dir,
 			    space_id, iid, run->id, VY_FILE_PAGE_INDEX);
-	xlog_remove_file(path, 0);
-	if (vy_run_write_index(run, run->page_info, dir, space_id, iid) != 0)
+	xlog_remove_file(index_btree_path, 0);
+	if (vy_run_write_index(run, page_info_array, dir, space_id, iid) != 0)
 		goto close_err;
-	if (vy_run_write_btree(run, run->page_info, dir, space_id, iid,
-			       cmp_def) != 0)
+
+	struct vy_page_index_entry *entries = region_alloc(
+		&fiber()->gc, (size_t)run->info.page_count * sizeof(*entries));
+	if (entries == NULL) {
+		diag_set(OutOfMemory, (size_t)run->info.page_count *
+			 sizeof(*entries), "region_alloc",
+			 "page index entries");
 		goto close_err;
+	}
+	for (uint32_t page_no = 0; page_no < run->info.page_count; page_no++) {
+		entries[page_no].idx = (int32_t)page_no;
+		entries[page_no].min_key = page_info_array[page_no].min_key;
+		entries[page_no].min_key_hint =
+			page_info_array[page_no].min_key_hint;
+	}
+	char index_offsets_path[PATH_MAX];
+	vy_run_snprint_path(index_offsets_path, sizeof(index_offsets_path), dir,
+			    space_id, iid, run->id, VY_FILE_INDEX_OFFSETS);
+	if (vy_page_index_write(&run->page_index, page_info_array,
+				entries, run->info.page_count,
+				index_path, index_btree_path,
+				index_offsets_path,
+				&run->env->page_index_cache_env,
+				&run->env->page_info_cache_env,
+				cmp_def) != 0)
+		goto close_err;
+
+	for (uint32_t i = 0; i < run->info.page_count; i++)
+		vy_page_info_destroy(&page_info_array[i]);
+	free(page_info_array);
 	return 0;
 close_err:
+	if (page_info_array != NULL) {
+		for (uint32_t i = 0; i < run->info.page_count; i++)
+			vy_page_info_destroy(&page_info_array[i]);
+		free(page_info_array);
+	}
 	vy_run_clear(run);
 	region_truncate(region, mem_used);
 	if (prev_tuple != NULL)
@@ -2780,7 +2936,8 @@ vy_slice_stream_read_page(struct vy_slice_stream *stream)
 	if (zdctx == NULL)
 		return -1;
 
-	struct vy_page_info *page_info = vy_run_page_info(run, stream->page_no);
+	struct vy_page_info *page_info =
+		vy_page_index_array_iterator_get(&stream->page_info_it);
 	stream->page = vy_page_new(page_info);
 	if (stream->page == NULL)
 		return -1;
@@ -2829,6 +2986,10 @@ vy_slice_stream_search(struct vy_stmt_stream *virt_stream)
 		vy_page_delete(stream->page);
 		stream->page = NULL;
 		stream->page_no++;
+		if (vy_page_index_array_iterator_next(
+		    &stream->slice->run->page_index.page_info,
+		    &stream->page_info_it) != 0)
+			return -1;
 		stream->pos_in_page = 0;
 	}
 	return 0;
@@ -2882,8 +3043,8 @@ vy_slice_stream_next(struct vy_stmt_stream *virt_stream, struct vy_entry *ret)
 	stream->pos_in_page++;
 
 	/* Check whether the position is out of page */
-	struct vy_page_info *page_info = vy_run_page_info(stream->slice->run,
-							  stream->page_no);
+	struct vy_page_info *page_info =
+		vy_page_index_array_iterator_get(&stream->page_info_it);
 	if (stream->pos_in_page >= page_info->row_count) {
 		/**
 		 * Out of page. Free page, move the position to the next page
@@ -2892,6 +3053,10 @@ vy_slice_stream_next(struct vy_stmt_stream *virt_stream, struct vy_entry *ret)
 		vy_page_delete(stream->page);
 		stream->page = NULL;
 		stream->page_no++;
+		if (vy_page_index_array_iterator_next(
+		    &stream->slice->run->page_index.page_info,
+		    &stream->page_info_it) != 0)
+			return -1;
 		stream->pos_in_page = 0;
 	}
 
@@ -2931,13 +3096,17 @@ static const struct vy_stmt_stream_iface vy_slice_stream_iface = {
 	.close = vy_slice_stream_close,
 };
 
-void
+int
 vy_slice_stream_open(struct vy_slice_stream *stream, struct vy_slice *slice,
 		     struct key_def *cmp_def, struct tuple_format *format)
 {
 	stream->base.iface = &vy_slice_stream_iface;
 
 	stream->page_no = slice->first_page_no;
+	stream->page_info_it = vy_page_index_array_invalid_iterator();
+	if (vy_page_index_get_page(&slice->run->page_index, stream->page_no,
+				   &stream->page_info_it) != 0)
+		return -1;
 	stream->pos_in_page = 0; /* We'll find it later */
 	stream->page = NULL;
 	stream->entry = vy_entry_none();
@@ -2946,4 +3115,5 @@ vy_slice_stream_open(struct vy_slice_stream *stream, struct vy_slice *slice,
 	stream->cmp_def = cmp_def;
 	stream->format = format;
 	tuple_format_ref(format);
+	return 0;
 }

@@ -3459,7 +3459,8 @@ vinyl_engine_backup(struct engine *engine, const struct vclock *vclock,
 			for (int type = 0; type < vy_file_MAX; type++) {
 				if (type == VY_FILE_RUN_INPROGRESS ||
 				    type == VY_FILE_INDEX_INPROGRESS ||
-				    type == VY_FILE_PAGE_INDEX_INPROGRESS)
+				    type == VY_FILE_PAGE_INDEX_INPROGRESS ||
+				    type == VY_FILE_INDEX_OFFSETS_INPROGRESS)
 					continue;
 				vy_run_snprint_path(path, sizeof(path),
 						    env->path,

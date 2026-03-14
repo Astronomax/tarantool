@@ -447,6 +447,7 @@ enum iproto_type {
 	VY_RUN_ROW_INDEX = 102,
 	/** Vinyl page index btree metadata stored in .btree file. */
 	VY_INDEX_BTREE = 103,
+	VY_INDEX_OFFSETS = 104,
 };
 
 /** IPROTO type name by code */
@@ -625,6 +626,8 @@ request_replace_body_create(struct request_replace_body *body,
 	_(STMT_STAT, 8)							\
 	/** Bloom filter for keys. */					\
 	_(BLOOM_FILTER, 9)						\
+	/** Index file format version. */				\
+	_(INDEX_FORMAT_VERSION, 10)					\
 
 #define VY_RUN_INFO_KEY_MEMBER(s, v) VY_RUN_INFO_ ## s = v,
 

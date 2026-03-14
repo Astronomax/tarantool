@@ -262,9 +262,9 @@ vy_range_update_dumps_per_compaction(struct vy_range *range);
  *
  * @retval true             If the range needs to be split.
  */
-bool
+int
 vy_range_needs_split(struct vy_range *range, int64_t range_size,
-		     const char **p_split_key);
+		     const char **p_split_key, bool *needs_split);
 
 /**
  * Check if a range needs to be coalesced with adjacent

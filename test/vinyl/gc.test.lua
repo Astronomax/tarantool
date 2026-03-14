@@ -31,7 +31,7 @@ s:insert{1} box.snapshot() -- dump
 s:insert{2} box.snapshot() -- dump + compaction
 while s.index.pk:stat().run_count > 1 do fiber.sleep(0.01) end -- wait for compaction
 gc()
-assert(wait_gc(ls_data, 3))
+assert(wait_gc(ls_data, 4))
 
 -- Check that gc keeps the current and previous log files.
 assert(wait_gc(ls_vylog, 2))

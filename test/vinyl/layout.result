@@ -99,7 +99,8 @@ test_run:cmd("setopt delimiter ';'")
 for i, path in pairs(files) do
     local suffix = string.gsub(path, '.*%.', '')
     if suffix ~= 'snap' and suffix ~= 'xlog'
-    and suffix ~= 'btree' and suffix ~= 'inprogress' then
+    and suffix ~= 'btree' and suffix ~= 'index_offsets'
+    and suffix ~= 'inprogress' then
         local rows = {}
         local i = 1
         for lsn, row in xlog.pairs(path) do
@@ -245,6 +246,7 @@ result
           type: RUNINFO
         BODY:
           min_lsn: 7
+          index_format_version: 1
           bloom_filter: <bloom_filter>
           max_key: ['ЭЭЭ']
           page_count: 1
@@ -335,6 +337,7 @@ result
           type: RUNINFO
         BODY:
           min_lsn: 20
+          index_format_version: 1
           bloom_filter: <bloom_filter>
           max_key: ['ЮЮЮ']
           page_count: 1
@@ -378,6 +381,7 @@ result
           type: RUNINFO
         BODY:
           min_lsn: 7
+          index_format_version: 1
           bloom_filter: <bloom_filter>
           max_key: [1010, '1010']
           page_count: 1
@@ -468,6 +472,7 @@ result
           type: RUNINFO
         BODY:
           min_lsn: 20
+          index_format_version: 1
           bloom_filter: <bloom_filter>
           max_key: [789, 'ююю']
           page_count: 1

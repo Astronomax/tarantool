@@ -58,14 +58,14 @@ while s.index.pk:stat().run_count > 1 do fiber.sleep(0.01) end -- wait for compa
 ...
 file_count()
 ---
-- 9
+- 12
 ...
 gc()
 ---
 ...
 file_count()
 ---
-- 9
+- 12
 ...
 errinj.set('ERRINJ_VY_GC', false)
 ---
@@ -76,7 +76,7 @@ gc()
 ...
 file_count()
 ---
-- 3
+- 4
 ...
 --
 -- Check that gc retries to delete files left
@@ -94,7 +94,7 @@ gc()
 ...
 file_count()
 ---
-- 3
+- 4
 ...
 errinj.set('ERRINJ_VY_GC', false)
 ---
@@ -125,7 +125,7 @@ s:insert{100, '12345'} box.snapshot() -- dump
 ...
 file_count()
 ---
-- 3
+- 4
 ...
 errinj.set('ERRINJ_VY_RUN_DISCARD', true)
 ---
@@ -141,7 +141,7 @@ s:insert{200, '67890'} box.snapshot() -- run file created, but dump fails
 ...
 file_count()
 ---
-- 6
+- 8
 ...
 test_run:cmd('restart server default')
 test_run = require('test_run').new()
@@ -173,7 +173,7 @@ function gc() temp:auto_increment{} box.snapshot() end
 ...
 file_count()
 ---
-- 3
+- 4
 ...
 s:select()
 ---

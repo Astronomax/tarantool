@@ -1680,8 +1680,10 @@ vy_task_compaction_new(struct vy_scheduler *scheduler, struct vy_worker *worker,
 	assert(range != NULL);
 	assert(range->compaction_priority > 1);
 
-	if (vy_lsm_split_range(lsm, range) ||
-	    vy_lsm_coalesce_range(lsm, range)) {
+	bool was_split;
+	if (vy_lsm_split_range(lsm, range, &was_split) != 0)
+		return -1;
+	if (was_split || vy_lsm_coalesce_range(lsm, range)) {
 		vy_scheduler_update_lsm(scheduler, lsm);
 		return 0;
 	}

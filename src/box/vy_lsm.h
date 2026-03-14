@@ -583,8 +583,9 @@ vy_lsm_find_range_intersection(struct vy_lsm *lsm,
  * the change in the metadata log, i.e. it doesn't involve heavy
  * operations, like writing a run file, and is done immediately.
  */
-bool
-vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range);
+int
+vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range,
+		   bool *was_split);
 
 /**
  * Coalesce a range with one or more its neighbors if it is too small,

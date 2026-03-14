@@ -1089,15 +1089,21 @@ vy_lsm_find_range_intersection(struct vy_lsm *lsm,
 	return 0;
 }
 
-bool
-vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range)
+int
+vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range,
+		   bool *was_split)
 {
+	*was_split = false;
+
 	struct tuple_format *key_format = lsm->env->key_format;
 
 	const char *split_key_raw;
-	if (!vy_range_needs_split(range, vy_lsm_range_size(lsm),
-				  &split_key_raw))
-		return false;
+	bool needs_split;
+	if (vy_range_needs_split(range, vy_lsm_range_size(lsm),
+				 &split_key_raw, &needs_split) != 0)
+		return -1;
+	if (!needs_split)
+		return 0;
 
 	/* Split a range in two parts. */
 	const int n_parts = 2;
@@ -1108,6 +1114,7 @@ vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range)
 	struct vy_entry split_key;
 	split_key = vy_entry_key_from_msgpack(key_format, lsm->cmp_def,
 					      split_key_raw);
+	free((char *)split_key_raw);
 	if (split_key.stmt == NULL)
 		goto fail;
 
@@ -1186,7 +1193,8 @@ vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range)
 		vy_slice_wait_pinned(slice);
 	vy_range_delete(range);
 	tuple_unref(split_key.stmt);
-	return true;
+	*was_split = true;
+	return 0;
 fail:
 	for (int i = 0; i < n_parts; i++) {
 		if (parts[i] != NULL)
@@ -1198,7 +1206,7 @@ fail:
 	diag_log();
 	say_error("%s: failed to split range %s",
 		  vy_lsm_name(lsm), vy_range_str(range));
-	return false;
+	return 0;
 }
 
 bool
@@ -1371,15 +1379,18 @@ vy_lsm_quantile(struct vy_lsm *lsm, double level,
 	if (key == NULL)
 		return 0;
 
+	/* Save the original pointer for freeing later. */
+	const char *key_to_free = key;
+
 	/*
 	 * Since it is an estimate, the found key may be outside the target
 	 * range, in which case we ignore it.
 	 */
 	if (vy_entry_compare_with_raw_key(begin, key, HINT_NONE, cmp_def) > 0)
-		return 0;
+		goto out;
 	if (vy_stmt_key_part_count(end.stmt, cmp_def) > 0 &&
 	    vy_entry_compare_with_raw_key(end, key, HINT_NONE, cmp_def) <= 0)
-		return 0;
+	    	goto out;
 	/*
 	 * Keys stored in runs are extended with primary key parts so we
 	 * can't just return the found key to the user, at least, not if
@@ -1398,5 +1409,7 @@ vy_lsm_quantile(struct vy_lsm *lsm, double level,
 	       key, key_end - key);
 	*quantile_key = (const char *)buf;
 	*quantile_key_size = size;
+out:
+	free((char *)key_to_free);
 	return 0;
 }

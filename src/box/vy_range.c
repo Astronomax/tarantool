@@ -51,6 +51,8 @@
 #include "vy_stat.h"
 #include "vy_stmt.h"
 
+#include "vy_run_proto.h"
+
 int
 vy_range_tree_cmp(struct vy_range *range_a, struct vy_range *range_b)
 {
@@ -451,15 +453,17 @@ vy_range_update_dumps_per_compaction(struct vy_range *range)
  * - We should only split if the last run size is greater than
  *   4/3 * range_size.
  */
-bool
+int
 vy_range_needs_split(struct vy_range *range, int64_t range_size,
-		     const char **p_split_key)
+		     const char **p_split_key, bool *needs_split)
 {
+	*needs_split = false;
+
 	struct vy_slice *slice;
 
 	/* The range hasn't been merged yet - too early to split it. */
 	if (range->n_compactions < 1)
-		return false;
+		return 0;
 
 	/* Find the oldest run. */
 	assert(!rlist_empty(&range->slices));
@@ -467,22 +471,27 @@ vy_range_needs_split(struct vy_range *range, int64_t range_size,
 
 	/* The range is too small to be split. */
 	if (slice->count.bytes < range_size * 4 / 3)
-		return false;
+		return 0;
 
 	/* Find the median key in the oldest run (approximately). */
-	struct vy_page_info *mid_page;
-	mid_page = vy_run_page_info(slice->run, slice->first_page_no +
-				    (slice->last_page_no -
-				     slice->first_page_no) / 2);
+	struct vy_page_info mid_page;
+	uint32_t mid_pos = slice->first_page_no +
+		(slice->last_page_no - slice->first_page_no) / 2;
+	if (vy_run_page_info(slice->run, mid_pos, &mid_page) != 0)
+		return -1;
 
-	struct vy_page_info *first_page = vy_run_page_info(slice->run,
-						slice->first_page_no);
+	struct vy_page_info first_page;
+	if (vy_run_page_info(slice->run, slice->first_page_no,
+			     &first_page) != 0) {
+		vy_page_info_destroy(&mid_page);
+		return -1;
+	}
 
 	/* No point in splitting if a new range is going to be empty. */
-	if (vy_key_compare(first_page->min_key, first_page->min_key_hint,
-			   mid_page->min_key, mid_page->min_key_hint,
+	if (vy_key_compare(first_page.min_key, first_page.min_key_hint,
+			   mid_page.min_key, mid_page.min_key_hint,
 			   range->cmp_def) == 0)
-		return false;
+		goto out;
 	/*
 	 * In extreme cases the median key can be < the beginning
 	 * of the slice, e.g.
@@ -500,20 +509,25 @@ vy_range_needs_split(struct vy_range *range, int64_t range_size,
 	 * In such cases there's no point in splitting the range.
 	 */
 	if (slice->begin.stmt != NULL &&
-	    vy_entry_compare_with_raw_key(slice->begin, mid_page->min_key,
-					  mid_page->min_key_hint,
+	    vy_entry_compare_with_raw_key(slice->begin, mid_page.min_key,
+					  mid_page.min_key_hint,
 					  range->cmp_def) >= 0)
-		return false;
+		goto out;
 	/*
 	 * The median key can't be >= the end of the slice as we
 	 * take the min key of a page for the median key.
 	 */
 	assert(slice->end.stmt == NULL ||
-	       vy_entry_compare_with_raw_key(slice->end, mid_page->min_key,
-					     mid_page->min_key_hint,
+	       vy_entry_compare_with_raw_key(slice->end, mid_page.min_key,
+					     mid_page.min_key_hint,
 					     range->cmp_def) > 0);
-	*p_split_key = mid_page->min_key;
-	return true;
+	*p_split_key = mid_page.min_key;
+	mid_page.min_key = NULL;
+	*needs_split = true;
+out:
+	vy_page_info_destroy(&mid_page);
+	vy_page_info_destroy(&first_page);
+	return 0;
 }
 
 /**

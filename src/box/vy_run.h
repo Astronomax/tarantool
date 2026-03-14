@@ -77,6 +77,7 @@ struct vy_run_env {
 	bool initial_join;
 	/** Cache environment for vy_page_index objects. */
 	struct vy_page_index_cache_env page_index_cache_env;
+	struct vy_page_info_cache_env page_info_cache_env;
 };
 
 /**
@@ -97,6 +98,8 @@ struct vy_run_info {
 	struct tuple_bloom *bloom;
 	/** Statement statistics. */
 	struct vy_stmt_stat stmt_stat;
+	/** Index file format version (0 = old, 1 = current). */
+	uint32_t index_format_version;
 };
 
 /**
@@ -111,12 +114,12 @@ struct vy_page_info {
 	uint32_t unpacked_size;
 	/** Number of statements in the page. */
 	uint32_t row_count;
+	/** Offset of the row index in the page. */
+	uint32_t row_index_offset;
 	/** Minimal key stored in the page. */
 	char *min_key;
 	/** Comparison hint of the min key. */
 	hint_t min_key_hint;
-	/** Offset of the row index in the page. */
-	uint32_t row_index_offset;
 };
 
 /**
@@ -127,12 +130,8 @@ struct vy_run {
 	struct vy_run_env *env;
 	/** Info about the run stored in the index file. */
 	struct vy_run_info info;
-	/** Info about the run pages stored in the index file. */
-	struct vy_page_info *page_info;
-	/** Page index (cache + on-disk btree). */
+	/** Page index (cache + on-disk btree + page metadata). */
 	struct vy_page_index page_index;
-	/** Path to the page index file (owned by the run). */
-	char *page_index_filepath;
 	/** Run data file. */
 	int fd;
 	/** Unique ID of this run. */
@@ -291,6 +290,7 @@ struct vy_run_iterator {
 	 */
 	struct vy_page *curr_page;
 	struct vy_page *prev_page;
+	struct vy_page_index_array_iterator page_info_it;
 	/** Is false until first .._get or .._next_.. method is called */
 	bool search_started;
 };
@@ -348,12 +348,8 @@ vy_run_env_enable_coio(struct vy_run_env *env);
 size_t
 vy_run_bloom_size(struct vy_run *run);
 
-static inline struct vy_page_info *
-vy_run_page_info(struct vy_run *run, uint32_t pos)
-{
-	assert(pos < run->info.page_count);
-	return &run->page_info[pos];
-}
+int
+vy_run_page_info(struct vy_run *run, uint32_t pos, struct vy_page_info *result);
 
 static inline bool
 vy_run_is_empty(struct vy_run *run)
@@ -435,6 +431,8 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 enum vy_file_type {
 	VY_FILE_INDEX,
 	VY_FILE_INDEX_INPROGRESS,
+	VY_FILE_INDEX_OFFSETS,
+	VY_FILE_INDEX_OFFSETS_INPROGRESS,
 	VY_FILE_RUN,
 	VY_FILE_RUN_INPROGRESS,
 	VY_FILE_PAGE_INDEX,
@@ -600,6 +598,7 @@ struct vy_slice_stream {
 	/** Current position */
 	uint32_t page_no;
 	uint32_t pos_in_page;
+	struct vy_page_index_array_iterator page_info_it;
 	/** Last page read */
 	struct vy_page *page;
 	/** The last tuple returned to user */
@@ -620,7 +619,7 @@ struct vy_slice_stream {
 /**
  * Open a run stream. Use vy_stmt_stream api for further work.
  */
-void
+int
 vy_slice_stream_open(struct vy_slice_stream *stream, struct vy_slice *slice,
 		     struct key_def *cmp_def, struct tuple_format *format);
 
@@ -650,6 +649,11 @@ struct vy_run_writer {
 	 * dumped.
 	 */
 	uint64_t page_size;
+	/**
+	 * Temporary page info array built during writing.
+	 * Freed when the writer is destroyed.
+	 */
+	struct vy_page_info *page_info;
 	/**
 	 * Current page info capacity. Can grow with page number.
 	 */
