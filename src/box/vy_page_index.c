@@ -26,6 +26,8 @@
 
 #define XLOG_META_TYPE_INDEX "INDEX"
 
+const float VY_BTREE_MEMORY_FACTOR = 0.5;
+
 static void
 vy_page_info_block_destroy(struct vy_page_info_block *block);
 
@@ -78,7 +80,19 @@ struct vy_page_index_btree_node {
 	 * Array of child node offsets (only for internal nodes).
 	 * Size is key_count + 1.
 	 */
-	uint64_t *children;
+	union {
+		/* For on disk part of the tree. */
+		uint64_t *offsets;
+		/* For in memory part of the tree. */
+		struct vy_page_index_btree_node **nodes;
+	} children;
+	bool children_in_memory;
+	/**
+	 * If true, this node is a shallow copy of an in-memory node.
+	 * Internal allocations (keys, children) are not owned and
+	 * must not be freed — destroy is a no-op.
+	 */
+	bool borrowed;
 	/** Offset of this node in the file. */
 	uint64_t offset;
 };
@@ -115,12 +129,27 @@ vy_page_index_entry_destroy(struct vy_page_index_entry *entry)
 static void
 vy_page_index_btree_node_destroy(struct vy_page_index_btree_node *node)
 {
+	if (node->borrowed)
+		return;
 	if (node->keys != NULL) {
 		for (uint32_t i = 0; i < node->key_count; i++)
 			vy_page_index_entry_destroy(&node->keys[i]);
 		free(node->keys);
 	}
-	free(node->children);
+	if (node->children_in_memory) {
+		if (node->children.nodes != NULL) {
+			for (uint32_t i = 0; i < node->key_count + 1; i++) {
+				if (node->children.nodes[i] != NULL) {
+					vy_page_index_btree_node_destroy(
+						node->children.nodes[i]);
+					free(node->children.nodes[i]);
+				}
+			}
+			free(node->children.nodes);
+		}
+	} else {
+		free(node->children.offsets);
+	}
 	TRASH(node);
 }
 
@@ -156,11 +185,27 @@ vy_page_index_btree_create(struct vy_page_index_btree *btree,
 	btree->filepath = strdup(filepath);
 	btree->fd = -1;
 	btree->page_count = page_count;
+	/*
+	 * Estimate the tree height and keep the top fraction
+	 * (VY_BTREE_MEMORY_FACTOR) of levels in memory.
+	 */
+	uint32_t tree_height = 0;
+	for (uint64_t n = page_count; n > 0;
+	     n /= VY_PAGE_INDEX_BTREE_ORDER)
+		tree_height++;
+	btree->in_memory_depth =
+		(uint32_t)(tree_height * VY_BTREE_MEMORY_FACTOR);
+	btree->root = NULL;
 }
 
 static void
 vy_page_index_btree_destroy(struct vy_page_index_btree *btree)
 {
+	if (btree->root != NULL) {
+		vy_page_index_btree_node_destroy(btree->root);
+		free(btree->root);
+		btree->root = NULL;
+	}
 	if (btree->fd >= 0) {
 		if (close(btree->fd) < 0)
 			say_syserror("close failed");
@@ -170,6 +215,10 @@ vy_page_index_btree_destroy(struct vy_page_index_btree *btree)
 	key_def_delete(btree->cmp_def);
 	TRASH(btree);
 }
+
+static struct vy_page_index_btree_node *
+vy_page_index_btree_read_in_memory(struct vy_page_index_btree *btree,
+				   uint64_t node_offset, uint32_t depth);
 
 static int
 vy_page_index_btree_open(struct vy_page_index_btree *btree)
@@ -184,6 +233,12 @@ vy_page_index_btree_open(struct vy_page_index_btree *btree)
 		btree->fd = fd;
 		assert(btree->data_offset != UINT64_MAX);
 	}
+	if (btree->in_memory_depth == 0 || btree->root != NULL)
+		return 0;
+	btree->root = vy_page_index_btree_read_in_memory(
+		btree, btree->root_offset, 0);
+	if (btree->root == NULL)
+		return -1;
 	return 0;
 }
 
@@ -416,7 +471,7 @@ vy_page_index_btree_node_write(struct vy_page_index_btree_node *node,
 
 	/* Children offsets (internal nodes only). */
 	if (node->type == VY_PAGE_INDEX_BTREE_NODE_INTERNAL) {
-		assert(node->children != NULL);
+		assert(node->children.offsets != NULL);
 		assert(children_offset != NULL);
 		*children_offset = *offset + (uint64_t)ibuf_used(wbuf);
 
@@ -427,7 +482,7 @@ vy_page_index_btree_node_write(struct vy_page_index_btree_node *node,
 				 "ibuf_alloc", "btree node write buffer");
 			return -1;
 		}
-		memcpy(pos, node->children, child_count * sizeof(uint64_t));
+		memcpy(pos, node->children.offsets, child_count * sizeof(uint64_t));
 	}
 
 	size_t size = ibuf_used(wbuf) - (size_t)*offset;
@@ -453,6 +508,7 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 			      uint64_t offset)
 {
 	memset(node, 0, sizeof(*node));
+	node->offset = offset;
 
 	if (btree->fd < 0) {
 		diag_set(SystemError, "B-tree file is not opened: %s",
@@ -537,12 +593,13 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 	if (vy_page_index_btree_ibuf_ensure(
 	    &rbuf, btree->fd, btree->filepath, &read_offset, bytes) != 0)
 		goto fail;
-	node->children = calloc(child_count, sizeof(uint64_t));
-	if (node->children == NULL) {
+	node->children.offsets = calloc(child_count, sizeof(uint64_t));
+	if (node->children.offsets == NULL) {
 		diag_set(OutOfMemory, bytes, "calloc", "btree node children");
 		goto fail;
 	}
-	memcpy(node->children, rbuf.rpos, bytes);
+	node->children_in_memory = false;
+	memcpy(node->children.offsets, rbuf.rpos, bytes);
 	rbuf.rpos += bytes;
 
 	ibuf_destroy(&rbuf);
@@ -552,6 +609,92 @@ fail:
 	ibuf_destroy(&rbuf);
 	vy_page_index_btree_node_destroy(node);
 	return -1;
+}
+
+static struct vy_page_index_btree_node *
+vy_page_index_btree_read_in_memory(struct vy_page_index_btree *btree,
+				   uint64_t node_offset, uint32_t depth)
+{
+	struct vy_page_index_btree_node *node =
+		calloc(1, sizeof(struct vy_page_index_btree_node));
+	if (node == NULL) {
+		diag_set(OutOfMemory, sizeof(struct vy_page_index_btree_node),
+			 "calloc", "btree node");
+		return NULL;
+	}
+	if (vy_page_index_btree_node_read(btree, node, node_offset) != 0) {
+		free(node);
+		return NULL;
+	}
+	if (node->type == VY_PAGE_INDEX_BTREE_NODE_LEAF ||
+	    depth + 1 >= btree->in_memory_depth)
+		return node;
+	node->children_in_memory = true;
+	uint64_t *offsets = node->children.offsets;
+	uint32_t child_count = node->key_count + 1;
+	node->children.nodes = calloc(child_count,
+				      sizeof(*node->children.nodes));
+	if (node->children.nodes == NULL) {
+		free(offsets);
+		free(node);
+		diag_set(OutOfMemory, child_count,
+			 "calloc", "btree node children");
+		return NULL;
+	}
+	for (uint32_t i = 0; i < node->key_count + 1; i++) {
+		node->children.nodes[i] =
+			vy_page_index_btree_read_in_memory(
+				btree, offsets[i], depth + 1);
+		if (node->children.nodes[i] == NULL) {
+			vy_page_index_btree_node_destroy(node);
+			free(node);
+			free(offsets);
+			return NULL;
+		}
+	}
+	free(offsets);
+	return node;
+}
+
+/**
+ * Get the root node. If the root is cached in memory, @a result
+ * receives a shallow (borrowed) copy. Otherwise the node is read
+ * from disk into @a result.
+ */
+static int
+vy_page_index_btree_node_get_root(
+	struct vy_page_index_btree *btree,
+	struct vy_page_index_btree_node *result)
+{
+	if (btree->root != NULL) {
+		*result = *btree->root;
+		result->borrowed = true;
+		return 0;
+	}
+	return vy_page_index_btree_node_read(
+		btree, result, btree->root_offset);
+}
+
+/**
+ * Get the child of @a node at position @a child. If the child is
+ * cached in memory, @a result receives a shallow (borrowed) copy.
+ * Otherwise the child is read from disk into @a result.
+ */
+static int
+vy_page_index_btree_node_get_child(
+	struct vy_page_index_btree *btree,
+	struct vy_page_index_btree_node *node, uint32_t child,
+	struct vy_page_index_btree_node *result)
+{
+	assert(node->type == VY_PAGE_INDEX_BTREE_NODE_INTERNAL);
+	assert(child <= node->key_count);
+	if (node->children_in_memory) {
+		*result = *node->children.nodes[child];
+		result->borrowed = true;
+		return 0;
+	}
+	uint64_t child_offset = node->children.offsets[child];
+	return vy_page_index_btree_node_read(btree, result, child_offset);
 }
 
 /* }} B Tree node serialize/deserialize */
@@ -616,72 +759,77 @@ vy_page_index_btree_path_push(struct vy_page_index_btree *btree,
 
 /**
  * Descent to the left (to the minimum) until a leaf (Finding the minimum in a
- * subtree).
+ * subtree). Takes ownership of @a start.
  */
 static int
 vy_page_index_btree_iterator_descend_min(struct vy_page_index_btree *btree,
 					 struct vy_page_index_btree_iterator *it,
-					 uint64_t offset)
+					 struct vy_page_index_btree_node *start)
 {
+	struct vy_page_index_btree_node node = *start;
 	while (true) {
-		struct vy_page_index_btree_node node;
-		if (vy_page_index_btree_node_read(btree, &node, offset) != 0)
-			return -1;
 		if (node.type == VY_PAGE_INDEX_BTREE_NODE_LEAF) {
-			it->node_offset = offset;
+			it->node_offset = node.offset;
 			it->pos = 0;
 			vy_page_index_btree_node_destroy(&node);
 			return 0;
 		}
-		assert(node.children != NULL);
 		uint32_t child = 0;
-		uint64_t child_offset = node.children[child];
+		struct vy_page_index_btree_node child_node;
+		if (vy_page_index_btree_node_get_child(
+		    btree, &node, child, &child_node) != 0) {
+			vy_page_index_btree_node_destroy(&node);
+			return -1;
+		}
 		struct vy_page_index_btree_path_entry entry = {
-			.node_offset = offset,
+			.node_offset = node.offset,
 			.key_count = node.key_count,
 			.child = child
 		};
-		/* The node is no longer needed. */
 		vy_page_index_btree_node_destroy(&node);
-		if (vy_page_index_btree_path_push(btree, it, entry) != 0)
+		if (vy_page_index_btree_path_push(btree, it, entry) != 0) {
+			vy_page_index_btree_node_destroy(&child_node);
 			return -1;
-		offset = child_offset;
+		}
+		node = child_node;
 	}
 }
 
 /**
  * Descent to the right (to the maximum) until a leaf (Finding the maximum in a
- * subtree).
+ * subtree). Takes ownership of @a start.
  */
 static int
 vy_page_index_btree_iterator_descend_max(struct vy_page_index_btree *btree,
 				         struct vy_page_index_btree_iterator *it,
-				         uint64_t offset)
+				         struct vy_page_index_btree_node *start)
 {
+	struct vy_page_index_btree_node node = *start;
 	while (true) {
-		struct vy_page_index_btree_node node;
-		if (vy_page_index_btree_node_read(btree, &node, offset) != 0)
-			return -1;
 		if (node.type == VY_PAGE_INDEX_BTREE_NODE_LEAF) {
-			it->node_offset = offset;
+			it->node_offset = node.offset;
 			it->pos = node.key_count - 1;
-			/* TODO: move node to iterator. */
 			vy_page_index_btree_node_destroy(&node);
 			return 0;
 		}
-		assert(node.children != NULL);
 		uint32_t child = node.key_count;
-		uint64_t child_offset = node.children[child];
+		struct vy_page_index_btree_node child_node;
+		if (vy_page_index_btree_node_get_child(
+		    btree, &node, child, &child_node) != 0) {
+			vy_page_index_btree_node_destroy(&node);
+			return -1;
+		}
 		struct vy_page_index_btree_path_entry entry = {
-			.node_offset = offset,
+			.node_offset = node.offset,
 			.key_count = node.key_count,
 			.child = child
 		};
-		/* The node is no longer needed. */
 		vy_page_index_btree_node_destroy(&node);
-		if (vy_page_index_btree_path_push(btree, it, entry) != 0)
+		if (vy_page_index_btree_path_push(btree, it, entry) != 0) {
+			vy_page_index_btree_node_destroy(&child_node);
 			return -1;
-		offset = child_offset;
+		}
+		node = child_node;
 	}
 }
 
@@ -702,7 +850,13 @@ vy_page_index_btree_iterator_next(struct vy_page_index_btree *btree,
 		/* Go down to child. */
 		uint32_t child = it->pos + 1;
 		assert(child <= node.key_count);
-		uint64_t child_offset = node.children[child];
+		struct vy_page_index_btree_node child_node;
+		if (vy_page_index_btree_node_get_child(
+		    btree, &node, child, &child_node) != 0) {
+			vy_page_index_btree_node_destroy(&node);
+			*it = vy_page_index_btree_invalid_iterator();
+			return -1;
+		}
 		struct vy_page_index_btree_path_entry entry = {
 			.node_offset = it->node_offset,
 			.key_count = node.key_count,
@@ -710,12 +864,13 @@ vy_page_index_btree_iterator_next(struct vy_page_index_btree *btree,
 		};
 		vy_page_index_btree_node_destroy(&node);
 		if (vy_page_index_btree_path_push(btree, it, entry) != 0) {
+			vy_page_index_btree_node_destroy(&child_node);
 			*it = vy_page_index_btree_invalid_iterator();
 			return -1;
 		}
 		/* Descent left to next minimum >= current. */
 		if (vy_page_index_btree_iterator_descend_min(
-		    btree, it, child_offset) != 0) {
+		    btree, it, &child_node) != 0) {
 			*it = vy_page_index_btree_invalid_iterator();
 			return -1;
 		}
@@ -750,16 +905,8 @@ static int
 vy_page_index_btree_iterator_prev(struct vy_page_index_btree *btree,
 				  struct vy_page_index_btree_iterator *it)
 {
-	if (vy_page_index_btree_iterator_is_invalid(it)) {
+	if (vy_page_index_btree_iterator_is_invalid(it))
 		return 0;
-		///*
-		// * Treat an invalid iterator as a past-the-end position:
-		// * prev(end) == last element.
-		// */
-		//memset(it, 0, sizeof(*it));
-		//return vy_page_index_btree_iterator_descend_max(
-		//	btree, it, btree->root_offset);
-	}
 
 	struct vy_page_index_btree_node node;
 	if (vy_page_index_btree_node_read(btree, &node, it->node_offset) != 0) {
@@ -771,7 +918,13 @@ vy_page_index_btree_iterator_prev(struct vy_page_index_btree *btree,
 		/* Go down to child. */
 		uint32_t child = it->pos;
 		assert(child <= node.key_count);
-		uint64_t child_offset = node.children[child];
+		struct vy_page_index_btree_node child_node;
+		if (vy_page_index_btree_node_get_child(
+		    btree, &node, child, &child_node) != 0) {
+			vy_page_index_btree_node_destroy(&node);
+			*it = vy_page_index_btree_invalid_iterator();
+			return -1;
+		}
 		struct vy_page_index_btree_path_entry entry = {
 			.node_offset = it->node_offset,
 			.key_count = node.key_count,
@@ -779,12 +932,13 @@ vy_page_index_btree_iterator_prev(struct vy_page_index_btree *btree,
 		};
 		vy_page_index_btree_node_destroy(&node);
 		if (vy_page_index_btree_path_push(btree, it, entry) != 0) {
+			vy_page_index_btree_node_destroy(&child_node);
 			*it = vy_page_index_btree_invalid_iterator();
 			return -1;
 		}
 		/* Descent right to next maximum <= current. */
 		if (vy_page_index_btree_iterator_descend_max(
-		    btree, it, child_offset) != 0) {
+		    btree, it, &child_node) != 0) {
 			*it = vy_page_index_btree_invalid_iterator();
 			return -1;
 		}
@@ -868,21 +1022,19 @@ vy_page_index_btree_lower_bound(struct vy_page_index_btree *btree,
 	*equal_key = false;
 	*result = vy_page_index_btree_invalid_iterator();
 
-	uint64_t offset = btree->root_offset;
 	struct vy_page_index_btree_iterator it = {
-		.node_offset = offset,
 		.pos = 0,
 		.depth = 0
 	};
 
+	struct vy_page_index_btree_node node;
+	if (vy_page_index_btree_node_get_root(btree, &node) != 0) {
+		*result = vy_page_index_btree_invalid_iterator();
+		return -1;
+	}
+
 	/* Descend. */
 	while (true) {
-		struct vy_page_index_btree_node node;
-		if (vy_page_index_btree_node_read(btree, &node, offset) != 0) {
-			*result = vy_page_index_btree_invalid_iterator();
-			return -1;
-		}
-
 		bool eq = false;
 		uint32_t child = vy_page_index_btree_node_lower_bound(
 			btree, &node, key, &eq);
@@ -890,14 +1042,9 @@ vy_page_index_btree_lower_bound(struct vy_page_index_btree *btree,
 
 		if (child < node.key_count) {
 			result->depth = it.depth;
-			/* TODO: think about copy here. */
 			memcpy(result->path, it.path,
 			       (size_t)it.depth * sizeof(it.path[0]));
-			/*
-			 * In `it` we use only depth and path, node_offset and
-			 * pos are invalid.
-			 */
-			result->node_offset = offset;
+			result->node_offset = node.offset;
 			result->pos = child;
 		}
 
@@ -906,18 +1053,25 @@ vy_page_index_btree_lower_bound(struct vy_page_index_btree *btree,
 			return 0;
 		}
 		struct vy_page_index_btree_path_entry entry = {
-			.node_offset = offset,
+			.node_offset = node.offset,
 			.key_count = node.key_count,
 			.child = child
 		};
-		assert(node.children != NULL);
-		offset = node.children[child];
-		vy_page_index_btree_node_destroy(&node);
-
-		if (vy_page_index_btree_path_push(btree, &it, entry) != 0) {
+		struct vy_page_index_btree_node child_node;
+		if (vy_page_index_btree_node_get_child(
+		    btree, &node, child, &child_node) != 0) {
+			vy_page_index_btree_node_destroy(&node);
 			*result = vy_page_index_btree_invalid_iterator();
 			return -1;
 		}
+		vy_page_index_btree_node_destroy(&node);
+
+		if (vy_page_index_btree_path_push(btree, &it, entry) != 0) {
+			vy_page_index_btree_node_destroy(&child_node);
+			*result = vy_page_index_btree_invalid_iterator();
+			return -1;
+		}
+		node = child_node;
 	}
 }
 
@@ -930,22 +1084,19 @@ vy_page_index_btree_upper_bound(struct vy_page_index_btree *btree,
 	*equal_key = false;
 	*result = vy_page_index_btree_invalid_iterator();
 
-	uint64_t offset = btree->root_offset;
 	struct vy_page_index_btree_iterator it = {
-		.node_offset = offset,
 		.pos = 0,
 		.depth = 0
 	};
 
-	while (true) {
-		struct vy_page_index_btree_node node;
-		if (vy_page_index_btree_node_read(btree, &node, offset) != 0) {
-			*result = vy_page_index_btree_invalid_iterator();
-			return -1;
-		}
+	struct vy_page_index_btree_node node;
+	if (vy_page_index_btree_node_get_root(btree, &node) != 0) {
+		*result = vy_page_index_btree_invalid_iterator();
+		return -1;
+	}
 
+	while (true) {
 		bool eq = false;
-		/* The only difference is we are using upper instead of lower. */
 		uint32_t child = vy_page_index_btree_node_upper_bound(
 			btree, &node, key, &eq);
 		*equal_key = *equal_key || eq;
@@ -954,7 +1105,7 @@ vy_page_index_btree_upper_bound(struct vy_page_index_btree *btree,
 			result->depth = it.depth;
 			memcpy(result->path, it.path,
 			       (size_t)it.depth * sizeof(it.path[0]));
-			result->node_offset = offset;
+			result->node_offset = node.offset;
 			result->pos = child;
 		}
 
@@ -963,18 +1114,25 @@ vy_page_index_btree_upper_bound(struct vy_page_index_btree *btree,
 			return 0;
 		}
 		struct vy_page_index_btree_path_entry entry = {
-			.node_offset = offset,
+			.node_offset = node.offset,
 			.key_count = node.key_count,
 			.child = child
 		};
-		assert(node.children != NULL);
-		offset = node.children[child];
-		vy_page_index_btree_node_destroy(&node);
-
-		if (vy_page_index_btree_path_push(btree, &it, entry) != 0) {
+		struct vy_page_index_btree_node child_node;
+		if (vy_page_index_btree_node_get_child(
+		    btree, &node, child, &child_node) != 0) {
+			vy_page_index_btree_node_destroy(&node);
 			*result = vy_page_index_btree_invalid_iterator();
 			return -1;
 		}
+		vy_page_index_btree_node_destroy(&node);
+
+		if (vy_page_index_btree_path_push(btree, &it, entry) != 0) {
+			vy_page_index_btree_node_destroy(&child_node);
+			*result = vy_page_index_btree_invalid_iterator();
+			return -1;
+		}
+		node = child_node;
 	}
 }
 
@@ -983,8 +1141,10 @@ vy_page_index_btree_last(struct vy_page_index_btree *btree,
 			 struct vy_page_index_btree_iterator *it)
 {
 	memset(it, 0, sizeof(*it));
-	return vy_page_index_btree_iterator_descend_max(
-		btree, it, btree->root_offset);
+	struct vy_page_index_btree_node root;
+	if (vy_page_index_btree_node_get_root(btree, &root) != 0)
+		return -1;
+	return vy_page_index_btree_iterator_descend_max(btree, it, &root);
 }
 
 static int
@@ -1120,7 +1280,7 @@ vy_page_index_btree_build_range(struct vy_page_index_entry *pages,
 	 * then build children and patch offsets.
 	 */
 	uint64_t zero_children[VY_PAGE_INDEX_BTREE_ORDER + 1] = {0};
-	node.children = zero_children;
+	node.children.offsets = zero_children;
 
 	const uint32_t base = remaining / children_count;
 	/*

@@ -125,6 +125,8 @@ vy_page_index_cache_env_destroy(struct vy_page_index_cache_env *env);
 
 /* {{{ B-tree */
 
+struct vy_page_index_btree_node;
+
 /** B-tree structure. */
 struct vy_page_index_btree {
 	/** Number of pages in the run. */
@@ -135,10 +137,14 @@ struct vy_page_index_btree {
 	uint64_t root_offset;
 	/** Offset of btree binary payload in file. */
 	uint64_t data_offset;
-
+	/** Filepath of the .btree file. */
 	char *filepath;
 	/** File descriptor for reading, lifetime is bound to run object. */
 	int fd;
+	/** Depth of the in memory part of the tree. */
+	uint32_t in_memory_depth;
+	/** In memory root node. */
+	struct vy_page_index_btree_node *root;
 };
 
 /* }}} B-tree */
