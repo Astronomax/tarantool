@@ -92,6 +92,12 @@ struct vy_lsm_env {
 	size_t bloom_size;
 	/** Size of memory used for page index. */
 	size_t page_index_size;
+	/** Total size of on-disk run metadata index files (.index). */
+	int64_t page_index_index_disk_size;
+	/** Total size of on-disk page index btree files (.btree). */
+	int64_t page_index_btree_disk_size;
+	/** Total size of on-disk page index offsets files (.index_offsets). */
+	int64_t page_index_offsets_disk_size;
 	/**
 	 * Size of disk space used for storing data of all spaces,
 	 * in bytes, without taking into account disk compression.
@@ -106,6 +112,8 @@ struct vy_lsm_env {
 	 * are stored in .index files, as well as the total size of
 	 * statements stored in secondary index .run files, which
 	 * is consistent with index.bsize().
+	 *
+	 * TODO: account btree and offsets files.
 	 */
 	int64_t disk_index_size;
 	/**

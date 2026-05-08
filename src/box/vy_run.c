@@ -356,6 +356,9 @@ vy_run_clear(struct vy_run *run)
 	if (run->page_index.page_count > 0)
 		vy_page_index_destroy(&run->page_index);
 	run->page_index_size = 0;
+	run->page_index_index_disk_size = 0;
+	run->page_index_btree_disk_size = 0;
+	run->page_index_offsets_disk_size = 0;
 	run->info.page_count = 0;
 	if (run->info.bloom != NULL) {
 		tuple_bloom_delete(run->info.bloom);
@@ -1936,13 +1939,25 @@ vy_run_recover_page_index(struct vy_run *run, const char *dir,
 	char index_offsets_path[PATH_MAX];
 	vy_run_snprint_path(index_offsets_path, sizeof(index_offsets_path), dir,
 			    space_id, iid, run->id, VY_FILE_INDEX_OFFSETS);
-	return vy_page_index_recover(&run->page_index,
-				    index_path, index_btree_path,
-				    index_offsets_path,
-				    &run->env->page_index_cache_env,
-				    &run->env->page_info_cache_env,
-				    cmp_def,
-				    page_info_array, run->info.page_count);
+	if (vy_page_index_recover(&run->page_index,
+				  index_path, index_btree_path,
+				  index_offsets_path,
+				  &run->env->page_index_cache_env,
+				  &run->env->page_info_cache_env,
+				  cmp_def,
+				  page_info_array, run->info.page_count) != 0)
+		return -1;
+	struct stat st;
+	run->page_index_index_disk_size = 0;
+	run->page_index_btree_disk_size = 0;
+	run->page_index_offsets_disk_size = 0;
+	if (stat(index_path, &st) == 0)
+		run->page_index_index_disk_size = st.st_size;
+	if (stat(index_btree_path, &st) == 0)
+		run->page_index_btree_disk_size = st.st_size;
+	if (stat(index_offsets_path, &st) == 0)
+		run->page_index_offsets_disk_size = st.st_size;
+	return 0;
 }
 
 static int
@@ -2361,6 +2376,12 @@ vy_run_write_index(struct vy_run *run, struct vy_page_info *page_info_array,
 	if (xlog_close(&index_xlog) != 0 ||
 	    xlog_materialize(&index_xlog) != 0)
 		goto fail;
+	/* Update .index write_bytes stats after a successful write. */
+	if (run->env != NULL) {
+		struct stat st;
+		if (stat(path, &st) == 0)
+			run->env->page_info_cache_env.io.write_bytes += st.st_size;
+	}
 	return 0;
 
 fail_rollback:
@@ -2668,6 +2689,17 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 				writer->cmp_def) != 0)
 		goto out;
 
+	struct stat st;
+	run->page_index_index_disk_size = 0;
+	run->page_index_btree_disk_size = 0;
+	run->page_index_offsets_disk_size = 0;
+	if (stat(index_path, &st) == 0)
+		run->page_index_index_disk_size = st.st_size;
+	if (stat(index_btree_path, &st) == 0)
+		run->page_index_btree_disk_size = st.st_size;
+	if (stat(index_offsets_path, &st) == 0)
+		run->page_index_offsets_disk_size = st.st_size;
+
 	vy_run_writer_destroy(writer);
 	rc = 0;
 out:
@@ -2839,6 +2871,17 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 				&run->env->page_info_cache_env,
 				cmp_def) != 0)
 		goto close_err;
+
+	struct stat st;
+	run->page_index_index_disk_size = 0;
+	run->page_index_btree_disk_size = 0;
+	run->page_index_offsets_disk_size = 0;
+	if (stat(index_path, &st) == 0)
+		run->page_index_index_disk_size = st.st_size;
+	if (stat(index_btree_path, &st) == 0)
+		run->page_index_btree_disk_size = st.st_size;
+	if (stat(index_offsets_path, &st) == 0)
+		run->page_index_offsets_disk_size = st.st_size;
 
 	for (uint32_t i = 0; i < run->info.page_count; i++)
 		vy_page_info_destroy(&page_info_array[i]);

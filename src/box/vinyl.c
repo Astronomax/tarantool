@@ -293,12 +293,21 @@ vy_info_append_tx(struct vy_env *env, struct info_handler *h)
 static void
 vy_info_append_memory(struct vy_env *env, struct info_handler *h)
 {
+	struct vy_page_index_cache_env *kc = &env->run_env.page_index_cache_env;
+	struct vy_page_info_cache_env *pc = &env->run_env.page_info_cache_env;
+
+	int64_t page_index_mem = (int64_t)kc->mem_used +
+				 (int64_t)kc->tree_mem_used +
+				 (int64_t)kc->btree_mem_used +
+				 (int64_t)pc->mem_used +
+				 (int64_t)pc->tree_mem_used;
+
 	info_table_begin(h, "memory");
 	info_append_int(h, "tx", vy_tx_manager_mem_used(env->xm));
 	info_append_int(h, "level0", lsregion_used(&env->mem_env.allocator));
 	info_append_int(h, "tuple", env->stmt_env.sum_tuple_size);
 	info_append_int(h, "tuple_cache", env->cache_env.mem_used);
-	info_append_int(h, "page_index", env->lsm_env.page_index_size);
+	info_append_int(h, "page_index", page_index_mem);
 	info_append_int(h, "bloom_filter", env->lsm_env.bloom_size);
 	info_table_end(h); /* memory */
 }
@@ -313,6 +322,49 @@ vy_info_append_disk(struct vy_env *env, struct info_handler *h)
 	info_table_end(h); /* disk */
 }
 
+static void
+vy_info_append_page_index(struct vy_env *env, struct info_handler *h)
+{
+	struct vy_page_index_cache_env *kc = &env->run_env.page_index_cache_env;
+	struct vy_page_info_cache_env *pc = &env->run_env.page_info_cache_env;
+
+	info_table_begin(h, "page_index");
+
+	info_table_begin(h, "key_cache");
+	info_append_int(h, "hit", kc->stat.hit);
+	info_append_int(h, "miss", kc->stat.miss);
+	info_append_int(h, "evict", kc->stat.evict);
+	info_append_int(h, "mem_used", kc->mem_used);
+	info_append_int(h, "mem_quota", kc->mem_quota);
+	info_table_end(h); /* key_cache */
+
+	info_table_begin(h, "page_info_cache");
+	info_append_int(h, "hit", pc->stat.hit);
+	info_append_int(h, "miss", pc->stat.miss);
+	info_append_int(h, "evict", pc->stat.evict);
+	info_append_int(h, "pinned", pc->stat.pinned);
+	info_append_int(h, "mem_used", pc->mem_used);
+	info_append_int(h, "mem_quota", pc->mem_quota);
+	info_table_end(h); /* page_info_cache */
+
+	info_table_begin(h, "io");
+	info_append_int(h, "read_bytes", kc->io.read_bytes + pc->io.read_bytes);
+	info_append_int(h, "read_ops", kc->io.read_ops + pc->io.read_ops);
+	info_append_int(h, "write_bytes", kc->io.write_bytes + pc->io.write_bytes);
+	info_table_end(h); /* io */
+
+	info_table_begin(h, "disk");
+	info_append_int(h, "index_bytes", env->lsm_env.page_index_index_disk_size);
+	info_append_int(h, "btree_bytes", env->lsm_env.page_index_btree_disk_size);
+	info_append_int(h, "offsets_bytes", env->lsm_env.page_index_offsets_disk_size);
+	info_append_int(h, "bytes", env->lsm_env.page_index_index_disk_size +
+			     env->lsm_env.page_index_btree_disk_size +
+			     env->lsm_env.page_index_offsets_disk_size);
+	info_table_end(h); /* disk */
+
+	info_table_end(h); /* page_index */
+}
+
 void
 vinyl_engine_stat(struct engine *engine, struct info_handler *h)
 {
@@ -322,6 +374,7 @@ vinyl_engine_stat(struct engine *engine, struct info_handler *h)
 	vy_info_append_tx(env, h);
 	vy_info_append_memory(env, h);
 	vy_info_append_disk(env, h);
+	vy_info_append_page_index(env, h);
 	vy_info_append_scheduler(env, h);
 	vy_info_append_regulator(env, h);
 	info_end(h);

@@ -76,6 +76,16 @@ vy_lsm_env_create(struct vy_lsm_env *env, const char *path,
 		  vy_upsert_thresh_cb upsert_thresh_cb,
 		  void *upsert_thresh_arg)
 {
+	env->bloom_size = 0;
+	env->page_index_size = 0;
+	env->page_index_index_disk_size = 0;
+	env->page_index_btree_disk_size = 0;
+	env->page_index_offsets_disk_size = 0;
+	env->disk_data_size = 0;
+	env->disk_index_size = 0;
+	env->compacted_data_size = 0;
+	env->compaction_queue_size = 0;
+
 	env->empty_key.hint = HINT_NONE;
 	env->empty_key.stmt = vy_key_new(key_format, NULL, 0);
 	if (env->empty_key.stmt == NULL)
@@ -732,6 +742,9 @@ vy_lsm_add_run(struct vy_lsm *lsm, struct vy_run *run)
 	struct vy_lsm_env *env = lsm->env;
 	size_t bloom_size = vy_run_bloom_size(run);
 	size_t page_index_size = run->page_index_size;
+	size_t page_index_index_disk_size = run->page_index_index_disk_size;
+	size_t page_index_btree_disk_size = run->page_index_btree_disk_size;
+	size_t page_index_offsets_disk_size = run->page_index_offsets_disk_size;
 
 	assert(rlist_empty(&run->in_lsm));
 	rlist_add_entry(&lsm->runs, run, in_lsm);
@@ -744,6 +757,9 @@ vy_lsm_add_run(struct vy_lsm *lsm, struct vy_run *run)
 
 	env->bloom_size += bloom_size;
 	env->page_index_size += page_index_size;
+	env->page_index_index_disk_size += (int64_t)page_index_index_disk_size;
+	env->page_index_btree_disk_size += (int64_t)page_index_btree_disk_size;
+	env->page_index_offsets_disk_size += (int64_t)page_index_offsets_disk_size;
 
 	/* Data size is consistent with space.bsize. */
 	if (lsm->index_id == 0)
@@ -760,6 +776,9 @@ vy_lsm_remove_run(struct vy_lsm *lsm, struct vy_run *run)
 	struct vy_lsm_env *env = lsm->env;
 	size_t bloom_size = vy_run_bloom_size(run);
 	size_t page_index_size = run->page_index_size;
+	size_t page_index_index_disk_size = run->page_index_index_disk_size;
+	size_t page_index_btree_disk_size = run->page_index_btree_disk_size;
+	size_t page_index_offsets_disk_size = run->page_index_offsets_disk_size;
 
 	assert(lsm->run_count > 0);
 	assert(!rlist_empty(&run->in_lsm));
@@ -773,6 +792,9 @@ vy_lsm_remove_run(struct vy_lsm *lsm, struct vy_run *run)
 
 	env->bloom_size -= bloom_size;
 	env->page_index_size -= page_index_size;
+	env->page_index_index_disk_size -= (int64_t)page_index_index_disk_size;
+	env->page_index_btree_disk_size -= (int64_t)page_index_btree_disk_size;
+	env->page_index_offsets_disk_size -= (int64_t)page_index_offsets_disk_size;
 
 	/* Data size is consistent with space.bsize. */
 	if (lsm->index_id == 0)
@@ -1379,9 +1401,7 @@ vy_lsm_quantile(struct vy_lsm *lsm, double level,
 	if (key == NULL)
 		return 0;
 
-	/* Save the original pointer for freeing later. */
 	const char *key_to_free = key;
-
 	/*
 	 * Since it is an estimate, the found key may be outside the target
 	 * range, in which case we ignore it.

@@ -72,7 +72,7 @@ vy_page_index_cache_tree_key_cmp(struct vy_page_index_cache_node *a,
 	return -vy_page_index_entry_compare_with_key(&a->entry, b, cmp_def);
 }
 
-#define VY_PAGE_INDEX_CACHE_TREE_EXTENT_SIZE (16 * 1024)
+#define VY_PAGE_INDEX_CACHE_TREE_EXTENT_SIZE 512//(16 * 1024)
 
 #define BPS_TREE_NAME vy_page_index_cache_tree
 #define BPS_TREE_BLOCK_SIZE 512
@@ -100,8 +100,26 @@ struct vy_page_index_cache_env {
 	struct rlist cache_lru;
 	struct mempool cache_node_mempool;
 	struct matras_allocator allocator;
+	/**
+	 * Memory occupied by matras extents backing the cache tree.
+	 * This memory is allocated/freed together with the allocator,
+	 * not with individual cache nodes.
+	 */
+	size_t tree_mem_used;
+	/** In-memory .btree levels (vy_page_index_btree), all runs on this env. */
+	size_t btree_mem_used;
 	size_t mem_used;
 	size_t mem_quota;
+	struct {
+		int64_t hit;
+		int64_t miss;
+		int64_t evict;
+	} stat;
+	struct {
+		int64_t read_bytes;
+		int64_t read_ops;
+		int64_t write_bytes;
+	} io;
 };
 
 struct vy_page_index_cache {
@@ -133,6 +151,8 @@ struct vy_page_index_btree {
 	uint32_t page_count;
 	/** Key definition for comparison. */
 	struct key_def *cmp_def;
+	/** For I/O accounting. */
+	struct vy_page_index_cache_env *env;
 	/** Root node offset in file. */
 	uint64_t root_offset;
 	/** Offset of btree binary payload in file. */
@@ -192,7 +212,7 @@ vy_page_info_cache_tree_key_cmp(struct vy_page_info_cache_node *a,
 	return (int)a->block.r - (int)b;
 }
 
-#define VY_PAGE_INFO_CACHE_TREE_EXTENT_SIZE (16 * 1024)
+#define VY_PAGE_INFO_CACHE_TREE_EXTENT_SIZE 512//(16 * 1024)
 
 #define BPS_TREE_NAME vy_page_info_cache_tree
 #define BPS_TREE_BLOCK_SIZE 512
@@ -220,8 +240,25 @@ struct vy_page_info_cache_env {
 	struct rlist cache_lru;
 	struct mempool cache_node_mempool;
 	struct matras_allocator allocator;
+	/**
+	 * Memory occupied by matras extents backing the cache tree.
+	 * This memory is allocated/freed together with the allocator,
+	 * not with individual cache nodes.
+	 */
+	size_t tree_mem_used;
 	size_t mem_used;
 	size_t mem_quota;
+	struct {
+		int64_t hit;
+		int64_t miss;
+		int64_t evict;
+		int64_t pinned;
+	} stat;
+	struct {
+		int64_t read_bytes;
+		int64_t read_ops;
+		int64_t write_bytes;
+	} io;
 };
 
 struct vy_page_info_cache {

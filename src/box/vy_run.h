@@ -140,6 +140,12 @@ struct vy_run {
 	struct vy_disk_stmt_counter count;
 	/** Size of memory used for storing page index. */
 	size_t page_index_size;
+	/** Size of run metadata index file on disk (.index). */
+	size_t page_index_index_disk_size;
+	/** Size of B-tree page index file on disk (.btree). */
+	size_t page_index_btree_disk_size;
+	/** Size of page info offsets file on disk (.index_offsets). */
+	size_t page_index_offsets_disk_size;
 	/** Max LSN stored on disk. */
 	int64_t dump_lsn;
 	/**

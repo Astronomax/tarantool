@@ -97,6 +97,37 @@ struct vy_page_index_btree_node {
 	uint64_t offset;
 };
 
+/** Memory owned by the in-memory .btree subtree rooted at @a node. */
+static size_t
+vy_page_index_btree_subtree_memory(const struct vy_page_index_btree_node *node)
+{
+	size_t s = sizeof(struct vy_page_index_btree_node);
+	if (node->keys != NULL) {
+		s += (size_t)node->key_count * sizeof(*node->keys);
+		for (uint32_t i = 0; i < node->key_count; i++) {
+			if (node->keys[i].min_key != NULL)
+				s += mp_len(node->keys[i].min_key);
+		}
+	}
+	if (node->type == VY_PAGE_INDEX_BTREE_NODE_LEAF)
+		return s;
+	if (node->children_in_memory) {
+		uint32_t n = node->key_count + 1;
+		s += (size_t)n * sizeof(*node->children.nodes);
+		for (uint32_t i = 0; i < n; i++) {
+			if (node->children.nodes[i] != NULL)
+				s += vy_page_index_btree_subtree_memory(
+					node->children.nodes[i]);
+		}
+		return s;
+	}
+	if (node->children.offsets != NULL) {
+		s += (size_t)(node->key_count + 1) *
+		     sizeof(*node->children.offsets);
+	}
+	return s;
+}
+
 static struct vy_page_index_entry
 vy_page_index_entry_copy(struct vy_page_index_entry *entry)
 {
@@ -175,11 +206,13 @@ vy_page_index_btree_new(struct key_def *cmp_def, uint64_t root_offset,
 static void
 vy_page_index_btree_create(struct vy_page_index_btree *btree,
 			   struct key_def *cmp_def,
+			   struct vy_page_index_cache_env *env,
 			   uint64_t root_offset, uint64_t data_offset,
 			   const char *filepath,
 			   uint32_t page_count)
 {
 	btree->cmp_def = key_def_dup(cmp_def);
+	btree->env = env;
 	btree->root_offset = root_offset;
 	btree->data_offset = data_offset;
 	btree->filepath = strdup(filepath);
@@ -202,6 +235,11 @@ static void
 vy_page_index_btree_destroy(struct vy_page_index_btree *btree)
 {
 	if (btree->root != NULL) {
+		if (btree->env != NULL) {
+			size_t bytes = vy_page_index_btree_subtree_memory(btree->root);
+			assert(btree->env->btree_mem_used >= bytes);
+			btree->env->btree_mem_used -= bytes;
+		}
 		vy_page_index_btree_node_destroy(btree->root);
 		free(btree->root);
 		btree->root = NULL;
@@ -239,6 +277,10 @@ vy_page_index_btree_open(struct vy_page_index_btree *btree)
 		btree, btree->root_offset, 0);
 	if (btree->root == NULL)
 		return -1;
+	if (btree->env != NULL) {
+		btree->env->btree_mem_used +=
+			vy_page_index_btree_subtree_memory(btree->root);
+	}
 	return 0;
 }
 
@@ -388,7 +430,8 @@ fail:
 }
 
 static int
-vy_page_index_btree_ibuf_ensure(struct ibuf *buf, int fd, const char *filename,
+vy_page_index_btree_ibuf_ensure(struct ibuf *buf, struct vy_page_index_btree *btree,
+				int fd, const char *filename,
 				uint64_t *read_offset, size_t need)
 {
 	enum {
@@ -413,6 +456,10 @@ vy_page_index_btree_ibuf_ensure(struct ibuf *buf, int fd, const char *filename,
 		if (nrd < 0) {
 			diag_set(SystemError, "failed to read btree node");
 			return -1;
+		}
+		if (btree != NULL && btree->env != NULL) {
+			btree->env->io.read_bytes += nrd;
+			btree->env->io.read_ops++;
 		}
 		if (nrd == 0) {
 			diag_set(ClientError, ER_INVALID_INDEX_FILE, filename,
@@ -473,7 +520,12 @@ vy_page_index_btree_node_write(struct vy_page_index_btree_node *node,
 	if (node->type == VY_PAGE_INDEX_BTREE_NODE_INTERNAL) {
 		assert(node->children.offsets != NULL);
 		assert(children_offset != NULL);
-		*children_offset = *offset + (uint64_t)ibuf_used(wbuf);
+		/*
+		 * children_offset is an offset within the write buffer, not the
+		 * resulting file offset. It is used by vy_page_index_btree_node_patch_children()
+		 * which patches wbuf->rpos directly.
+		 */
+		*children_offset = (uint64_t)ibuf_used(wbuf);
 
 		size_t child_count = (size_t)node->key_count + 1;
 		pos = ibuf_alloc(wbuf, child_count * sizeof(uint64_t));
@@ -524,7 +576,7 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 
 	/* Header: type + key_count */
 	if (vy_page_index_btree_ibuf_ensure(
-	    &rbuf, btree->fd, btree->filepath, &read_offset, bytes) != 0)
+	    &rbuf, btree, btree->fd, btree->filepath, &read_offset, bytes) != 0)
 		goto fail;
 
 	node->type = (enum vy_page_index_btree_node_type)
@@ -558,7 +610,7 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 	for (uint32_t i = 0; i < node->key_count; i++) {
 		/* entry size prefix */
 		if (vy_page_index_btree_ibuf_ensure(
-		    &rbuf, btree->fd, btree->filepath, &read_offset,
+		    &rbuf, btree, btree->fd, btree->filepath, &read_offset,
 		    sizeof(uint32_t)) != 0)
 			goto fail;
 		uint32_t entry_size = *(const uint32_t *)rbuf.rpos;
@@ -572,7 +624,7 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 		}
 
 		if (vy_page_index_btree_ibuf_ensure(
-		    &rbuf, btree->fd, btree->filepath, &read_offset,
+		    &rbuf, btree, btree->fd, btree->filepath, &read_offset,
 		    entry_size) != 0)
 			goto fail;
 
@@ -591,7 +643,7 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 	size_t child_count = (size_t)node->key_count + 1;
 	bytes = child_count * sizeof(uint64_t);
 	if (vy_page_index_btree_ibuf_ensure(
-	    &rbuf, btree->fd, btree->filepath, &read_offset, bytes) != 0)
+	    &rbuf, btree, btree->fd, btree->filepath, &read_offset, bytes) != 0)
 		goto fail;
 	node->children.offsets = calloc(child_count, sizeof(uint64_t));
 	if (node->children.offsets == NULL) {
@@ -1427,13 +1479,20 @@ vy_page_index_btree_write(struct vy_page_index_entry *entries,
 			  uint32_t page_count,
 			  const char *filepath,
 			  uint64_t *root_offset,
-			  uint64_t *data_offset)
+			  uint64_t *data_offset,
+			  struct vy_page_index_cache_env *env)
 {
 	if (vy_page_index_btree_build(entries, page_count, filepath) != 0)
 		return -1;
 	if (vy_page_index_btree_read_meta(filepath,
 					  root_offset, data_offset) != 0)
 		return -1;
+	if (env != NULL) {
+		struct stat st;
+		if (stat(filepath, &st) == 0) {
+			env->io.write_bytes += st.st_size;
+		}
+	}
 	return 0;
 }
 
@@ -1446,14 +1505,19 @@ vy_page_index_btree_write(struct vy_page_index_entry *entries,
 static void *
 vy_page_index_cache_tree_page_alloc(struct matras_allocator *allocator)
 {
-	(void)allocator;
+	struct vy_page_index_cache_env *env =
+		container_of(allocator, struct vy_page_index_cache_env, allocator);
+	env->tree_mem_used += VY_PAGE_INDEX_CACHE_TREE_EXTENT_SIZE;
 	return xmalloc(VY_PAGE_INDEX_CACHE_TREE_EXTENT_SIZE);
 }
 
 static void
 vy_page_index_cache_tree_page_free(struct matras_allocator *allocator, void *ptr)
 {
-	(void)allocator;
+	struct vy_page_index_cache_env *env =
+		container_of(allocator, struct vy_page_index_cache_env, allocator);
+	assert(env->tree_mem_used >= VY_PAGE_INDEX_CACHE_TREE_EXTENT_SIZE);
+	env->tree_mem_used -= VY_PAGE_INDEX_CACHE_TREE_EXTENT_SIZE;
 	free(ptr);
 }
 
@@ -1462,8 +1526,12 @@ vy_page_index_cache_env_create(struct vy_page_index_cache_env *env,
 			       struct slab_cache *slab_cache)
 {
 	rlist_create(&env->cache_lru);
+	env->tree_mem_used = 0;
+	env->btree_mem_used = 0;
 	env->mem_used = 0;
 	env->mem_quota = 10000;
+	memset(&env->stat, 0, sizeof(env->stat));
+	memset(&env->io, 0, sizeof(env->io));
 	mempool_create(&env->cache_node_mempool, slab_cache,
 		       sizeof(struct vy_page_index_cache_node));
 	matras_allocator_create(&env->allocator,
@@ -1563,6 +1631,7 @@ vy_page_index_cache_gc_step(struct vy_page_index_cache_env *env)
 	//vy_stmt_counter_acct_tuple(&cache->stat.evict, node->info);
 	vy_page_index_cache_tree_delete(&cache->cache_tree, node, NULL);
 	vy_page_index_cache_node_delete(cache->env, node);
+	env->stat.evict++;
 }
 
 static void
@@ -1749,14 +1818,19 @@ vy_page_index_cache_find_chain(struct vy_page_index_cache *cache,
 static void *
 vy_page_info_cache_tree_page_alloc(struct matras_allocator *allocator)
 {
-	(void)allocator;
+	struct vy_page_info_cache_env *env =
+		container_of(allocator, struct vy_page_info_cache_env, allocator);
+	env->tree_mem_used += VY_PAGE_INFO_CACHE_TREE_EXTENT_SIZE;
 	return xmalloc(VY_PAGE_INFO_CACHE_TREE_EXTENT_SIZE);
 }
 
 static void
 vy_page_info_cache_tree_page_free(struct matras_allocator *allocator, void *ptr)
 {
-	(void)allocator;
+	struct vy_page_info_cache_env *env =
+		container_of(allocator, struct vy_page_info_cache_env, allocator);
+	assert(env->tree_mem_used >= VY_PAGE_INFO_CACHE_TREE_EXTENT_SIZE);
+	env->tree_mem_used -= VY_PAGE_INFO_CACHE_TREE_EXTENT_SIZE;
 	free(ptr);
 }
 
@@ -1765,8 +1839,11 @@ vy_page_info_cache_env_create(struct vy_page_info_cache_env *env,
 			       struct slab_cache *slab_cache)
 {
 	rlist_create(&env->cache_lru);
+	env->tree_mem_used = 0;
 	env->mem_used = 0;
 	env->mem_quota = 10000;
+	memset(&env->stat, 0, sizeof(env->stat));
+	memset(&env->io, 0, sizeof(env->io));
 	mempool_create(&env->cache_node_mempool, slab_cache,
 		       sizeof(struct vy_page_info_cache_node));
 	matras_allocator_create(&env->allocator,
@@ -1859,6 +1936,7 @@ vy_page_info_cache_gc_step(struct vy_page_info_cache_env *env)
 		struct vy_page_info_cache *cache = node->cache;
 		vy_page_info_cache_tree_delete(&cache->cache_tree, node, NULL);
 		vy_page_info_cache_node_delete(cache->env, node);
+		env->stat.evict++;
 		return;
 	}
 	/* All nodes are pinned, nothing to evict. */
@@ -1890,6 +1968,7 @@ static inline void
 vy_page_info_cache_node_pin(struct vy_page_info_cache_node *node)
 {
 	node->pin_count++;
+	node->cache->env->stat.pinned++;
 }
 
 static inline void
@@ -1897,6 +1976,7 @@ vy_page_info_cache_node_unpin(struct vy_page_info_cache_node *node)
 {
 	assert(node->pin_count > 0);
 	node->pin_count--;
+	node->cache->env->stat.pinned--;
 }
 
 static inline void
@@ -2079,7 +2159,8 @@ vy_page_index_array_open(struct vy_page_index_array *array)
 
 static int
 vy_page_index_array_build(struct vy_page_info *page_info, uint32_t page_count,
-			  const char *index_path, const char *index_offsets_path)
+			  const char *index_path, const char *index_offsets_path,
+			  struct vy_page_info_cache_env *env)
 {
 	(void)page_info;
 
@@ -2108,6 +2189,10 @@ vy_page_index_array_build(struct vy_page_info *page_info, uint32_t page_count,
 	}
 	close(fd);
 	free(offsets);
+	if (env != NULL) {
+		env->io.write_bytes += (int64_t)(sizeof(page_count) +
+			(size_t)page_count * sizeof(uint64_t));
+	}
 	return 0;
 }
 
@@ -2150,6 +2235,10 @@ vy_page_index_array_read_block_offsets(struct vy_page_index_array *array,
 			"Failed to read offsets");
 		free(offsets);
 		return -1;
+	}
+	if (array->cache.env != NULL) {
+		array->cache.env->io.read_bytes += nrd;
+		array->cache.env->io.read_ops++;
 	}
 	*offsets_out = offsets;
 	return 0;
@@ -2210,6 +2299,10 @@ vy_page_index_array_read_block(struct vy_page_index_array *array,
 		if (readen < 0) {
 			diag_set(SystemError, "failed to read from file");
 			goto fail;
+		}
+		if (array->cache.env != NULL) {
+			array->cache.env->io.read_bytes += readen;
+			array->cache.env->io.read_ops++;
 		}
 		if (readen != (ssize_t)size) {
 			vy_page_index_offsets_invalid_diag_set(
@@ -2303,6 +2396,7 @@ vy_page_index_array_read_block_to_cache(struct vy_page_index_array *array,
 				       uint32_t block_idx,
 				       struct vy_page_info_cache_tree_iterator *cache_it)
 {
+	array->cache.env->stat.miss++;
 	struct vy_page_info_block block;
 	if (vy_page_index_array_read_block(array, block_idx, &block) != 0)
 		return -1;
@@ -2340,6 +2434,7 @@ vy_page_index_array_iterator_next(struct vy_page_index_array *array,
 	if (next_node != NULL && *next_node != NULL) {
 		struct vy_page_info_block *next_block = &(*next_node)->block;
 		if (it->page_no == next_block->l) {
+			array->cache.env->stat.hit++;
 			vy_page_index_array_iterator_set_node(
 				array, it, &cache_it, *next_node);
 			return 0;
@@ -2386,6 +2481,7 @@ vy_page_index_array_iterator_prev(struct vy_page_index_array *array,
 	if (prev_node != NULL && *prev_node != NULL) {
 		struct vy_page_info_block *prev_block = &(*prev_node)->block;
 		if (it->page_no + 1 == prev_block->r) {
+			array->cache.env->stat.hit++;
 			vy_page_index_array_iterator_set_node(
 				array, it, &cache_it, *prev_node);
 			return 0;
@@ -2419,6 +2515,7 @@ vy_page_index_array_get_page(struct vy_page_index_array *array,
 		vy_page_info_cache_tree_iterator_get_elem(
 			&array->cache.cache_tree, &cache_it);
 	if (node != NULL && *node != NULL && (*node)->block.l <= page_no) {
+		array->cache.env->stat.hit++;
 		assert(page_no < (*node)->block.r);
 		it->page_no = page_no;
 		vy_page_index_array_iterator_set_node(
@@ -2464,6 +2561,7 @@ vy_page_index_create(struct vy_page_index *index,
 	vy_page_index_cache_create(&index->cache, page_index_cache_env,
 				   cmp_def, page_count);
 	vy_page_index_btree_create(&index->btree, cmp_def,
+				   page_index_cache_env,
 				   btree_root_offset, btree_data_offset,
 				   index_btree_path,
 				   page_count);
@@ -2519,7 +2617,8 @@ vy_page_index_recover(struct vy_page_index *index,
 		if (vy_page_index_btree_write(entries, page_count,
 					      index_btree_path,
 					      &btree_root_offset,
-					      &btree_data_offset) != 0)
+					      &btree_data_offset,
+					      page_index_cache_env) != 0)
 			return -1;
 	}
 
@@ -2529,7 +2628,8 @@ vy_page_index_recover(struct vy_page_index *index,
 			 index_offsets_path);
 		if (vy_page_index_array_build(page_info_array, page_count,
 					      index_path,
-					      index_offsets_path) != 0)
+					      index_offsets_path,
+					      page_info_cache_env) != 0)
 			return -1;
 	}
 
@@ -2560,10 +2660,12 @@ vy_page_index_write(struct vy_page_index *index,
 	uint64_t btree_root_offset;
 	uint64_t btree_data_offset;
 	if (vy_page_index_btree_write(entries, page_count, index_btree_path,
-				      &btree_root_offset, &btree_data_offset) != 0)
+				      &btree_root_offset, &btree_data_offset,
+				      page_index_cache_env) != 0)
 		return -1;
 	if (vy_page_index_array_build(page_info, page_count,
-				      index_path, index_offsets_path) != 0)
+				      index_path, index_offsets_path,
+				      page_info_cache_env) != 0)
 		return -1;
 	vy_page_index_create(index,
 			     index_path, index_btree_path, index_offsets_path,
@@ -2592,6 +2694,10 @@ vy_page_index_find_page(struct vy_page_index *index, struct vy_entry key,
 	struct vy_page_index_entry prev = {0}, next = {0};
 	bool hit = vy_page_index_cache_find_chain(
 		&index->cache, key, lower_bound, &next, &prev, equal_key);
+	if (hit)
+		index->cache.env->stat.hit++;
+	else
+		index->cache.env->stat.miss++;
 	if (hit)
 		goto out;
 
