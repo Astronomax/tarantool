@@ -9,6 +9,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <pmatomic.h>
+
+#include "cbus.h"
+
 #include "diag.h"
 #include "errcode.h"
 #include "fiber.h"
@@ -30,6 +34,60 @@ const float VY_BTREE_MEMORY_FACTOR = 0.5;
 
 static void
 vy_page_info_block_destroy(struct vy_page_info_block *block);
+
+static int
+vy_page_index_btree_find_chain(struct vy_page_index_btree *btree,
+			       struct vy_entry key, bool lower_bound,
+			       struct vy_page_index_entry *next,
+			       struct vy_page_index_entry *prev,
+			       bool *equal_key);
+
+static int
+vy_page_index_array_read_block(struct vy_page_index_array *array,
+			       uint32_t block_idx,
+			       struct vy_page_info_block *result);
+
+/** Cbus task for reading btree chain on cache miss. */
+struct vy_page_index_btree_find_task {
+	struct cbus_call_msg base;
+	struct vy_page_index_btree *btree;
+	struct vy_entry key;
+	bool lower_bound;
+	bool equal_key;
+	struct vy_page_index_entry next;
+	struct vy_page_index_entry prev;
+};
+
+static int
+vy_page_index_btree_find_cb(struct cbus_call_msg *base)
+{
+	struct vy_page_index_btree_find_task *task =
+		(struct vy_page_index_btree_find_task *)base;
+	task->equal_key = false;
+	memset(&task->next, 0, sizeof(task->next));
+	memset(&task->prev, 0, sizeof(task->prev));
+	return vy_page_index_btree_find_chain(task->btree, task->key,
+					      task->lower_bound,
+					      &task->next, &task->prev,
+					      &task->equal_key);
+}
+
+/** Cbus task for reading a page_info block on cache miss. */
+struct vy_page_info_block_read_task {
+	struct cbus_call_msg base;
+	struct vy_page_index_array *array;
+	uint32_t block_idx;
+	struct vy_page_info_block block;
+};
+
+static int
+vy_page_info_block_read_cb(struct cbus_call_msg *base)
+{
+	struct vy_page_info_block_read_task *task =
+		(struct vy_page_info_block_read_task *)base;
+	return vy_page_index_array_read_block(task->array, task->block_idx,
+					      &task->block);
+}
 
 /* {{{ B Tree */
 
@@ -458,8 +516,8 @@ vy_page_index_btree_ibuf_ensure(struct ibuf *buf, struct vy_page_index_btree *bt
 			return -1;
 		}
 		if (btree != NULL && btree->env != NULL) {
-			btree->env->io.read_bytes += nrd;
-			btree->env->io.read_ops++;
+			pm_atomic_fetch_add(&btree->env->io.read_bytes, nrd);
+			pm_atomic_fetch_add(&btree->env->io.read_ops, 1);
 		}
 		if (nrd == 0) {
 			diag_set(ClientError, ER_INVALID_INDEX_FILE, filename,
@@ -2237,8 +2295,8 @@ vy_page_index_array_read_block_offsets(struct vy_page_index_array *array,
 		return -1;
 	}
 	if (array->cache.env != NULL) {
-		array->cache.env->io.read_bytes += nrd;
-		array->cache.env->io.read_ops++;
+		pm_atomic_fetch_add(&array->cache.env->io.read_bytes, nrd);
+		pm_atomic_fetch_add(&array->cache.env->io.read_ops, 1);
 	}
 	*offsets_out = offsets;
 	return 0;
@@ -2301,8 +2359,9 @@ vy_page_index_array_read_block(struct vy_page_index_array *array,
 			goto fail;
 		}
 		if (array->cache.env != NULL) {
-			array->cache.env->io.read_bytes += readen;
-			array->cache.env->io.read_ops++;
+			pm_atomic_fetch_add(&array->cache.env->io.read_bytes,
+					    readen);
+			pm_atomic_fetch_add(&array->cache.env->io.read_ops, 1);
 		}
 		if (readen != (ssize_t)size) {
 			vy_page_index_offsets_invalid_diag_set(
@@ -2397,11 +2456,17 @@ vy_page_index_array_read_block_to_cache(struct vy_page_index_array *array,
 				       struct vy_page_info_cache_tree_iterator *cache_it)
 {
 	array->cache.env->stat.miss++;
-	struct vy_page_info_block block;
-	if (vy_page_index_array_read_block(array, block_idx, &block) != 0)
+	if (vy_page_index_array_open(array) != 0)
+		return -1;
+	struct vy_page_info_block_read_task task;
+	memset(&task, 0, sizeof(task));
+	task.array = array;
+	task.block_idx = block_idx;
+	if (vy_run_env_coio_call(array->cache.env->run_env, &task.base,
+				 vy_page_info_block_read_cb) != 0)
 		return -1;
 	struct vy_page_info_cache_node *node = NULL;
-	return vy_page_info_cache_add_block(array, &block, cache_it, &node);
+	return vy_page_info_cache_add_block(array, &task.block, cache_it, &node);
 }
 
 int
@@ -2702,11 +2767,28 @@ vy_page_index_find_page(struct vy_page_index *index, struct vy_entry key,
 		goto out;
 
 	/* Miss. Go to disk. */
-	if (vy_page_index_btree_find_chain(
-	    &index->btree, key, lower_bound, &next, &prev, equal_key) != 0)
+	if (vy_page_index_btree_open(&index->btree) != 0)
 		return -1;
+	struct vy_page_index_btree_find_task task;
+	memset(&task, 0, sizeof(task));
+	task.btree = &index->btree;
+	task.key = key;
+	task.lower_bound = lower_bound;
+	if (vy_run_env_coio_call(index->cache.env->run_env, &task.base,
+				 vy_page_index_btree_find_cb) != 0)
+		return -1;
+	*equal_key = task.equal_key;
+	next = task.next;
+	prev = task.prev;
 
-	assert(prev.idx + 1 == next.idx);
+	if (prev.idx + 1 != next.idx) {
+		vy_page_index_entry_destroy(&prev);
+		vy_page_index_entry_destroy(&next);
+		diag_set(ClientError, ER_INVALID_INDEX_FILE,
+			 index->btree.filepath, "Invalid page index chain");
+		return -1;
+	}
+
 	vy_page_index_cache_add_chain(&index->cache, &next, &prev);
 
 out:

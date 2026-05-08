@@ -45,6 +45,7 @@
 #include "vy_page_index.h"
 
 #include "small/mempool.h"
+#include "cbus.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -347,6 +348,14 @@ vy_run_env_destroy(struct vy_run_env *env);
  */
 void
 vy_run_env_enable_coio(struct vy_run_env *env);
+
+/**
+ * Execute a task on behalf of a reader thread.
+ * If coio is disabled (e.g. during recovery), executes synchronously.
+ */
+int
+vy_run_env_coio_call(struct vy_run_env *env, struct cbus_call_msg *msg,
+		     cbus_call_f func);
 
 /**
  * Return the size of a run bloom filter.

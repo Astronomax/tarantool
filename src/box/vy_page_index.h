@@ -12,6 +12,7 @@ extern "C" {
 #endif /* defined(__cplusplus) */
 
 struct vy_page_info;
+struct vy_run_env;
 
 struct vy_page_index_entry {
 	/** Index in sorted array. */
@@ -97,6 +98,8 @@ vy_page_index_cache_tree_key_cmp(struct vy_page_index_cache_node *a,
 #undef BPS_TREE_IS_IDENTICAL
 
 struct vy_page_index_cache_env {
+	/** Back-pointer for coio offload. */
+	struct vy_run_env *run_env;
 	struct rlist cache_lru;
 	struct mempool cache_node_mempool;
 	struct matras_allocator allocator;
@@ -237,6 +240,8 @@ vy_page_info_cache_tree_key_cmp(struct vy_page_info_cache_node *a,
 #undef BPS_TREE_IS_IDENTICAL
 
 struct vy_page_info_cache_env {
+	/** Back-pointer for coio offload. */
+	struct vy_run_env *run_env;
 	struct rlist cache_lru;
 	struct mempool cache_node_mempool;
 	struct matras_allocator allocator;

@@ -190,6 +190,8 @@ vy_run_env_create(struct vy_run_env *env, int read_threads)
 {
 	memset(env, 0, sizeof(*env));
 	env->reader_pool_size = read_threads;
+	env->page_index_cache_env.run_env = env;
+	env->page_info_cache_env.run_env = env;
 	tt_pthread_key_create(&env->zdctx_key, vy_free_zdctx);
 	mempool_create(&env->read_task_pool, cord_slab_cache(),
 		       sizeof(struct vy_page_read_task));
@@ -228,12 +230,12 @@ vy_run_env_enable_coio(struct vy_run_env *env)
 /**
  * Execute a task on behalf of a reader thread.
  */
-static int
+int
 vy_run_env_coio_call(struct vy_run_env *env, struct cbus_call_msg *msg,
 		     cbus_call_f func)
 {
 	/* Optimization: use blocking I/O during WAL recovery. */
-	if (env->reader_pool == NULL)
+	if (env->reader_pool == NULL || !cord_is_main())
 		return func(msg);
 
 	/* Pick a reader thread. */
