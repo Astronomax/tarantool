@@ -666,21 +666,21 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 	}
 
 	for (uint32_t i = 0; i < node->key_count; i++) {
-		/* entry size prefix */
+		/* Read entry size prefix. */
 		if (vy_page_index_btree_ibuf_ensure(
 		    &rbuf, btree, btree->fd, btree->filepath, &read_offset,
 		    sizeof(uint32_t)) != 0)
 			goto fail;
 		uint32_t entry_size = *(const uint32_t *)rbuf.rpos;
 		rbuf.rpos += sizeof(uint32_t);
-
+		/* Invalid entry size. */
 		if (entry_size == 0) {
 			diag_set(ClientError, ER_INVALID_INDEX_FILE,
 				 btree->filepath,
 				 "Invalid page index entry size");
 			goto fail;
 		}
-
+		/* Read entry size bytes and decode the entry. */
 		if (vy_page_index_btree_ibuf_ensure(
 		    &rbuf, btree, btree->fd, btree->filepath, &read_offset,
 		    entry_size) != 0)
@@ -698,6 +698,7 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 		return 0;
 	}
 
+	/* Read children offsets. */
 	size_t child_count = (size_t)node->key_count + 1;
 	bytes = child_count * sizeof(uint64_t);
 	if (vy_page_index_btree_ibuf_ensure(
@@ -721,10 +722,20 @@ fail:
 	return -1;
 }
 
+/**
+ * Read a B-tree node into memory.
+ * A B-tree can store the first few levels in memory.
+ *
+ * @param btree B-tree.
+ * @param node_offset Node offset.
+ * @param depth Depth.
+ * @return Node (NULL on error).
+ */
 static struct vy_page_index_btree_node *
 vy_page_index_btree_read_in_memory(struct vy_page_index_btree *btree,
 				   uint64_t node_offset, uint32_t depth)
 {
+	/* TODO: use malloc instead of calloc. */
 	struct vy_page_index_btree_node *node =
 		calloc(1, sizeof(struct vy_page_index_btree_node));
 	if (node == NULL) {
@@ -736,32 +747,40 @@ vy_page_index_btree_read_in_memory(struct vy_page_index_btree *btree,
 		free(node);
 		return NULL;
 	}
+	/* We load into memory no more than in_memory_depth levels. */
 	if (node->type == VY_PAGE_INDEX_BTREE_NODE_LEAF ||
 	    depth + 1 >= btree->in_memory_depth)
 		return node;
+	/* Load children into memory. */
 	node->children_in_memory = true;
 	uint64_t *offsets = node->children.offsets;
 	uint32_t child_count = node->key_count + 1;
 	node->children.nodes = calloc(child_count,
 				      sizeof(*node->children.nodes));
 	if (node->children.nodes == NULL) {
-		free(offsets);
-		free(node);
 		diag_set(OutOfMemory, child_count,
 			 "calloc", "btree node children");
-		return NULL;
+		free(node);
+		node = NULL;
+		goto exit;
 	}
 	for (uint32_t i = 0; i < node->key_count + 1; i++) {
+		/* Load children recursively. */
 		node->children.nodes[i] =
 			vy_page_index_btree_read_in_memory(
 				btree, offsets[i], depth + 1);
 		if (node->children.nodes[i] == NULL) {
 			vy_page_index_btree_node_destroy(node);
 			free(node);
-			free(offsets);
-			return NULL;
+			node = NULL;
+			break;
 		}
 	}
+exit:
+	/**
+	 * Offsets were allocated in vy_page_index_btree_node_read
+	 * using calloc.
+	 */
 	free(offsets);
 	return node;
 }
@@ -781,6 +800,7 @@ vy_page_index_btree_node_get_root(
 		result->borrowed = true;
 		return 0;
 	}
+	/* The tree is entirely on disk. */
 	return vy_page_index_btree_node_read(
 		btree, result, btree->root_offset);
 }
@@ -803,6 +823,7 @@ vy_page_index_btree_node_get_child(
 		result->borrowed = true;
 		return 0;
 	}
+	/* The current node is deeper than in_memory_depth. */
 	uint64_t child_offset = node->children.offsets[child];
 	return vy_page_index_btree_node_read(btree, result, child_offset);
 }
@@ -839,6 +860,11 @@ vy_page_index_btree_iterator_get_elem(struct vy_page_index_btree *btree,
 		return 0;
 	}
 	struct vy_page_index_btree_node node;
+	/**
+	 * The iterator always reads the node from disk for now.
+	 * But we have several levels of the tree in memory.
+	 * TODO: use cached nodes if possible.
+	 */
 	if (vy_page_index_btree_node_read(btree, &node, it->node_offset) != 0)
 		return -1;
 	*result = vy_page_index_entry_move(&node.keys[it->pos]);
@@ -852,6 +878,7 @@ vy_page_index_invalid_diag_set(const char *filename, const char *message)
 	diag_set(ClientError, ER_INVALID_INDEX_FILE, filename, message);
 }
 
+/* Push a path entry to the iterator. */
 static inline int
 vy_page_index_btree_path_push(struct vy_page_index_btree *btree,
 			      struct vy_page_index_btree_iterator *it,
@@ -896,6 +923,7 @@ vy_page_index_btree_iterator_descend_min(struct vy_page_index_btree *btree,
 			.key_count = node.key_count,
 			.child = child
 		};
+		/* The parent is not used anymore. */
 		vy_page_index_btree_node_destroy(&node);
 		if (vy_page_index_btree_path_push(btree, it, entry) != 0) {
 			vy_page_index_btree_node_destroy(&child_node);
@@ -972,6 +1000,7 @@ vy_page_index_btree_iterator_next(struct vy_page_index_btree *btree,
 			.key_count = node.key_count,
 			.child = child
 		};
+		/* The parent is not used anymore. */
 		vy_page_index_btree_node_destroy(&node);
 		if (vy_page_index_btree_path_push(btree, it, entry) != 0) {
 			vy_page_index_btree_node_destroy(&child_node);
@@ -1082,6 +1111,7 @@ vy_page_index_btree_iterator_prev(struct vy_page_index_btree *btree,
 
 /* {{ B Tree lower/upper_bound */
 
+/* Binary search in keys[] for the lower bound. */
 static uint32_t
 vy_page_index_btree_node_lower_bound(struct vy_page_index_btree *btree,
 				     struct vy_page_index_btree_node *node,
@@ -1102,6 +1132,7 @@ vy_page_index_btree_node_lower_bound(struct vy_page_index_btree *btree,
 	return range[1];
 }
 
+/* Binary search in keys[] for the upper bound. */
 static uint32_t
 vy_page_index_btree_node_upper_bound(struct vy_page_index_btree *btree,
 				     struct vy_page_index_btree_node *node,
@@ -1246,6 +1277,7 @@ vy_page_index_btree_upper_bound(struct vy_page_index_btree *btree,
 	}
 }
 
+/* Find the last element in the tree. */
 static int
 vy_page_index_btree_last(struct vy_page_index_btree *btree,
 			 struct vy_page_index_btree_iterator *it)
@@ -1257,6 +1289,10 @@ vy_page_index_btree_last(struct vy_page_index_btree *btree,
 	return vy_page_index_btree_iterator_descend_max(btree, it, &root);
 }
 
+/**
+ * Find the chain of elements for the given key.
+ * A chain is a pair of consecutive elements.
+ */
 static int
 vy_page_index_btree_find_chain(struct vy_page_index_btree *btree,
 			       struct vy_entry key, bool lower_bound,
@@ -1529,9 +1565,7 @@ fail:
 	return -1;
 }
 
-/**
- * Write page index B-tree to file.
- */
+/* Write page index B-tree to file. */
 static int
 vy_page_index_btree_write(struct vy_page_index_entry *entries,
 			  uint32_t page_count,
@@ -1545,6 +1579,7 @@ vy_page_index_btree_write(struct vy_page_index_entry *entries,
 	if (vy_page_index_btree_read_meta(filepath,
 					  root_offset, data_offset) != 0)
 		return -1;
+	/* Update IO stats. */
 	if (env != NULL) {
 		struct stat st;
 		if (stat(filepath, &st) == 0) {
@@ -1558,7 +1593,7 @@ vy_page_index_btree_write(struct vy_page_index_entry *entries,
 
 /* }}} B Tree */
 
-/* {{{ Page Index Cache */
+/* {{{ Page Index Cache - a cache of page index B-tree nodes. */
 
 static void *
 vy_page_index_cache_tree_page_alloc(struct matras_allocator *allocator)
@@ -1638,6 +1673,7 @@ vy_page_index_cache_node_delete(struct vy_page_index_cache_env *env,
 	mempool_free(&env->cache_node_mempool, node);
 }
 
+/* Touch a node to move it to the front of the LRU list. */
 static inline void
 vy_page_index_cache_touch(struct vy_page_index_cache_node *node)
 {
@@ -1689,6 +1725,7 @@ vy_page_index_cache_gc_step(struct vy_page_index_cache_env *env)
 	//vy_stmt_counter_acct_tuple(&cache->stat.evict, node->info);
 	vy_page_index_cache_tree_delete(&cache->cache_tree, node, NULL);
 	vy_page_index_cache_node_delete(cache->env, node);
+	/* Update eviction stats. */
 	env->stat.evict++;
 }
 
@@ -1815,6 +1852,7 @@ vy_page_index_cache_add_chain(struct vy_page_index_cache *cache,
 	assert(successor == next_node);
 }
 
+/* Find the chain of elements for the given key. */
 static bool
 vy_page_index_cache_find_chain(struct vy_page_index_cache *cache,
 			       struct vy_entry key, bool lower_bound,
@@ -1840,6 +1878,7 @@ vy_page_index_cache_find_chain(struct vy_page_index_cache *cache,
 		next->min_key_hint = HINT_NONE;
 		it = vy_page_index_cache_tree_last(&cache->cache_tree);
 	} else {
+		/* Move to the front of the LRU list. */
 		vy_page_index_cache_touch(*next_node);
 		*next = vy_page_index_entry_copy(&(*next_node)->entry);
 		if (next->idx == 0) {
@@ -1871,7 +1910,10 @@ vy_page_index_cache_find_chain(struct vy_page_index_cache *cache,
 /* }}} Page Index Cache */
 
 
-/* {{{ Page Info Cache */
+/**
+ * {{{ Page Info Cache - a cache of page info blocks.
+ * Used to get page info by page number.
+ */
 
 static void *
 vy_page_info_cache_tree_page_alloc(struct matras_allocator *allocator)
@@ -1994,6 +2036,7 @@ vy_page_info_cache_gc_step(struct vy_page_info_cache_env *env)
 		struct vy_page_info_cache *cache = node->cache;
 		vy_page_info_cache_tree_delete(&cache->cache_tree, node, NULL);
 		vy_page_info_cache_node_delete(cache->env, node);
+		/* Update eviction stats. */
 		env->stat.evict++;
 		return;
 	}
@@ -2022,27 +2065,33 @@ vy_page_info_cache_env_set_quota(struct vy_page_info_cache_env *env,
 	}
 }
 
+/* Pin a node to prevent it from being evicted. */
 static inline void
 vy_page_info_cache_node_pin(struct vy_page_info_cache_node *node)
 {
 	node->pin_count++;
+	/* Update pinned stats. */
 	node->cache->env->stat.pinned++;
 }
 
+/* Unpin a node to allow it to be evicted. */
 static inline void
 vy_page_info_cache_node_unpin(struct vy_page_info_cache_node *node)
 {
 	assert(node->pin_count > 0);
 	node->pin_count--;
+	/* Update pinned stats. */
 	node->cache->env->stat.pinned--;
 }
 
+/* Touch a node to move it to the front of the LRU list. */
 static inline void
 vy_page_info_cache_touch(struct vy_page_info_cache_node *node)
 {
 	rlist_move_entry(&node->cache->env->cache_lru, node, in_lru);
 }
 
+/* Add a block to the cache. */
 static int
 vy_page_info_cache_add_block(struct vy_page_index_array *array,
 			     struct vy_page_info_block *block,
@@ -2094,7 +2143,18 @@ vy_page_info_cache_add_block(struct vy_page_index_array *array,
 
 /* }}} Page Info Cache */
 
-/* {{{ Page Index Array */
+/**
+ * {{{ Page Index Array - a sorted array of page info blocks. 
+ * Used to get page info by page number.
+ *
+ * Contains fixed size entries in .offsets file to quickly get
+ * the offset in the .index file by page number.
+ * Also uses Page Info Cache for page info blocks.
+ *
+ * Getting page_info in the worst case requires 2 I/O operations:
+ * 1. Read the offset from the .offsets file.
+ * 2. Read the page info block from the .index file.
+ */
 
 static void
 vy_page_info_block_destroy(struct vy_page_info_block *block)
@@ -2216,18 +2276,18 @@ vy_page_index_array_open(struct vy_page_index_array *array)
 }
 
 static int
-vy_page_index_array_build(struct vy_page_info *page_info, uint32_t page_count,
-			  const char *index_path, const char *index_offsets_path,
+vy_page_index_array_build(uint32_t page_count,
+			  const char *index_path,
+			  const char *index_offsets_path,
 			  struct vy_page_info_cache_env *env)
 {
-	(void)page_info;
-
 	uint64_t *offsets = calloc(page_count, sizeof(uint64_t));
 	if (offsets == NULL) {
 		diag_set(OutOfMemory, page_count * sizeof(uint64_t),
 			 "calloc", "page info offsets");
 		return -1;
 	}
+	/* Read offsets from the .index file. */
 	if (vy_page_info_read_index(index_path, offsets, page_count) != 0) {
 		free(offsets);
 		return -1;
@@ -2247,6 +2307,7 @@ vy_page_index_array_build(struct vy_page_info *page_info, uint32_t page_count,
 	}
 	close(fd);
 	free(offsets);
+	/* Update IO stats. */
 	if (env != NULL) {
 		env->io.write_bytes += (int64_t)(sizeof(page_count) +
 			(size_t)page_count * sizeof(uint64_t));
@@ -2302,6 +2363,7 @@ vy_page_index_array_read_block_offsets(struct vy_page_index_array *array,
 	return 0;
 }
 
+/* Read a block of page info from the .index file. */
 static int
 vy_page_index_array_read_block(struct vy_page_index_array *array,
 			      uint32_t block_idx,
@@ -2423,9 +2485,12 @@ vy_page_index_array_iterator_set_node(struct vy_page_index_array *array,
 {
 	(void)array;
 	assert(node != NULL);
+	/* Unpin the previous node to allow it to be evicted. */
 	if (it->node != NULL)
 		vy_page_info_cache_node_unpin(it->node);
+	/* Pin the node to prevent it from being evicted. */
 	vy_page_info_cache_node_pin(node);
+	/* Touch the node to move it to the front of the LRU list. */
 	vy_page_info_cache_touch(node);
 	it->cache_it = *cache_it;
 	it->node = node;
@@ -2450,11 +2515,13 @@ vy_page_index_array_iterator_get(struct vy_page_index_array_iterator *it)
 	return it->node->block.data[it->page_no - it->node->block.l];
 }
 
+/* Read a block of page info from the .index file to the cache. */
 static int
 vy_page_index_array_read_block_to_cache(struct vy_page_index_array *array,
 				       uint32_t block_idx,
 				       struct vy_page_info_cache_tree_iterator *cache_it)
 {
+	/* Update miss stats. */
 	array->cache.env->stat.miss++;
 	if (vy_page_index_array_open(array) != 0)
 		return -1;
@@ -2499,6 +2566,7 @@ vy_page_index_array_iterator_next(struct vy_page_index_array *array,
 	if (next_node != NULL && *next_node != NULL) {
 		struct vy_page_info_block *next_block = &(*next_node)->block;
 		if (it->page_no == next_block->l) {
+			/* Update hit stats. */
 			array->cache.env->stat.hit++;
 			vy_page_index_array_iterator_set_node(
 				array, it, &cache_it, *next_node);
@@ -2546,6 +2614,7 @@ vy_page_index_array_iterator_prev(struct vy_page_index_array *array,
 	if (prev_node != NULL && *prev_node != NULL) {
 		struct vy_page_info_block *prev_block = &(*prev_node)->block;
 		if (it->page_no + 1 == prev_block->r) {
+			/* Update hit stats. */
 			array->cache.env->stat.hit++;
 			vy_page_index_array_iterator_set_node(
 				array, it, &cache_it, *prev_node);
@@ -2580,6 +2649,7 @@ vy_page_index_array_get_page(struct vy_page_index_array *array,
 		vy_page_info_cache_tree_iterator_get_elem(
 			&array->cache.cache_tree, &cache_it);
 	if (node != NULL && *node != NULL && (*node)->block.l <= page_no) {
+		/* Update hit stats. */
 		array->cache.env->stat.hit++;
 		assert(page_no < (*node)->block.r);
 		it->page_no = page_no;
@@ -2645,6 +2715,7 @@ vy_page_index_destroy(struct vy_page_index *index)
 	TRASH(index);
 }
 
+/* Recover the page index from the .index, .btree and .offsets files. */
 int
 vy_page_index_recover(struct vy_page_index *index,
 		      const char *index_path,
@@ -2691,7 +2762,7 @@ vy_page_index_recover(struct vy_page_index *index,
 	if (access(index_offsets_path, F_OK) != 0) {
 		say_info("missing index offsets file `%s`, building",
 			 index_offsets_path);
-		if (vy_page_index_array_build(page_info_array, page_count,
+		if (vy_page_index_array_build(page_count,
 					      index_path,
 					      index_offsets_path,
 					      page_info_cache_env) != 0)
@@ -2710,9 +2781,9 @@ vy_page_index_recover(struct vy_page_index *index,
 	return 0;
 }
 
+/* Write the page index to the .index, .btree and .offsets files. */
 int
 vy_page_index_write(struct vy_page_index *index,
-		    struct vy_page_info *page_info,
 		    struct vy_page_index_entry *entries,
 		    uint32_t page_count,
 		    const char *index_path,
@@ -2728,7 +2799,7 @@ vy_page_index_write(struct vy_page_index *index,
 				      &btree_root_offset, &btree_data_offset,
 				      page_index_cache_env) != 0)
 		return -1;
-	if (vy_page_index_array_build(page_info, page_count,
+	if (vy_page_index_array_build(page_count,
 				      index_path, index_offsets_path,
 				      page_info_cache_env) != 0)
 		return -1;
@@ -2744,6 +2815,7 @@ vy_page_index_write(struct vy_page_index *index,
 	return 0;
 }
 
+/* Find the page number for the given key. */
 int
 vy_page_index_find_page(struct vy_page_index *index, struct vy_entry key,
 			enum iterator_type itype,
@@ -2759,6 +2831,7 @@ vy_page_index_find_page(struct vy_page_index *index, struct vy_entry key,
 	struct vy_page_index_entry prev = {0}, next = {0};
 	bool hit = vy_page_index_cache_find_chain(
 		&index->cache, key, lower_bound, &next, &prev, equal_key);
+	/* Update cache stats. */
 	if (hit)
 		index->cache.env->stat.hit++;
 	else
@@ -2810,6 +2883,7 @@ out:
 	return 0;
 }
 
+/* Get the page info by page number. */
 int
 vy_page_index_get_page(struct vy_page_index *index, uint32_t page_no,
 		       struct vy_page_index_array_iterator *it)

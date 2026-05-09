@@ -2682,8 +2682,8 @@ vy_run_writer_commit(struct vy_run_writer *writer)
 	vy_run_snprint_path(index_offsets_path, sizeof(index_offsets_path),
 			    writer->dirpath, writer->space_id, writer->iid,
 			    run->id, VY_FILE_INDEX_OFFSETS);
-	if (vy_page_index_write(&run->page_index, writer->page_info,
-				entries, run->info.page_count,
+	if (vy_page_index_write(&run->page_index, entries,
+				run->info.page_count,
 				index_path, index_btree_path,
 				index_offsets_path,
 				&run->env->page_index_cache_env,
@@ -2865,8 +2865,8 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 	char index_offsets_path[PATH_MAX];
 	vy_run_snprint_path(index_offsets_path, sizeof(index_offsets_path), dir,
 			    space_id, iid, run->id, VY_FILE_INDEX_OFFSETS);
-	if (vy_page_index_write(&run->page_index, page_info_array,
-				entries, run->info.page_count,
+	if (vy_page_index_write(&run->page_index, entries,
+				run->info.page_count,
 				index_path, index_btree_path,
 				index_offsets_path,
 				&run->env->page_index_cache_env,

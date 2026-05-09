@@ -14,6 +14,7 @@ extern "C" {
 struct vy_page_info;
 struct vy_run_env;
 
+/** Page index entry. */
 struct vy_page_index_entry {
 	/** Index in sorted array. */
 	int32_t idx;
@@ -113,11 +114,13 @@ struct vy_page_index_cache_env {
 	size_t btree_mem_used;
 	size_t mem_used;
 	size_t mem_quota;
+	/** Cache stats. */
 	struct {
 		int64_t hit;
 		int64_t miss;
 		int64_t evict;
 	} stat;
+	/** IO stats. */
 	struct {
 		int64_t read_bytes;
 		int64_t read_ops;
@@ -253,12 +256,14 @@ struct vy_page_info_cache_env {
 	size_t tree_mem_used;
 	size_t mem_used;
 	size_t mem_quota;
+	/** Cache stats. */
 	struct {
 		int64_t hit;
 		int64_t miss;
 		int64_t evict;
 		int64_t pinned;
 	} stat;
+	/** IO stats. */
 	struct {
 		int64_t read_bytes;
 		int64_t read_ops;
@@ -352,7 +357,6 @@ vy_page_index_recover(struct vy_page_index *index,
 
 int
 vy_page_index_write(struct vy_page_index *index,
-		    struct vy_page_info *page_info,
 		    struct vy_page_index_entry *entries,
 		    uint32_t page_count,
 		    const char *index_path,
