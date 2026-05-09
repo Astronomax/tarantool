@@ -1,6 +1,7 @@
 -- schema.lua (internal file)
 --
 local ffi = require('ffi')
+local jit = require('jit')
 local msgpack = require('msgpack')
 local msgpackffi = require('msgpackffi')
 local fun = require('fun')
@@ -2227,7 +2228,11 @@ base_index_mt.bsize = function(index)
     return tonumber(ret)
 end
 -- index.quantile
-base_index_mt.quantile = function(index, level, begin_key, end_key)
+--
+-- The same yielding C call must not run from a LuaJIT-compiled trace
+-- (fiber switch while in compiled code); disable JIT for this wrapper.
+local base_index_mt_quantile
+base_index_mt_quantile = function(index, level, begin_key, end_key)
     check_index_arg(index, 'quantile', 2)
     if level == nil then
         box.error(box.error.ILLEGAL_PARAMS,
@@ -2240,7 +2245,12 @@ base_index_mt.quantile = function(index, level, begin_key, end_key)
     -- reallocated when we encode end_key, we can't use the pointers
     -- returned by tuple_encode(begin_key), so we set its pointers after
     -- all allocations are done.
-    local ibuf = cord_ibuf_take()
+    --
+    -- Vinyl quantile may yield for disk I/O inside box_index_quantile. A cord
+    -- ibuf must not be held across that yield: on yield the cord buffer is put
+    -- back automatically, so a second cord_ibuf_put after resume trips
+    -- cord_buf_clear_owner. Use a Lua ibuf instead.
+    local ibuf = buffer.ibuf()
     tuple_encode(ibuf, begin_key, 2)
     local end_key, end_key_end = tuple_encode(ibuf, end_key, 2)
     begin_key = ibuf.rpos
@@ -2253,7 +2263,6 @@ base_index_mt.quantile = function(index, level, begin_key, end_key)
                                           begin_key, begin_key_end,
                                           end_key, end_key_end,
                                           quantile_key, quantile_key_end) == 0
-    cord_ibuf_put(ibuf)
     if not ok then
         box.error(box.error.last(), 2)
     end
@@ -2269,6 +2278,8 @@ base_index_mt.quantile = function(index, level, begin_key, end_key)
     builtin.box_region_truncate(region_svp)
     return result
 end
+jit.off(base_index_mt_quantile)
+base_index_mt.quantile = base_index_mt_quantile
 -- index.fselect - formatted select.
 -- Options can be passed through opts, fselect_opts and global variables.
 -- If an option is in opts table or set in global variable - it must have
