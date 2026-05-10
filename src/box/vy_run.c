@@ -898,6 +898,8 @@ vy_run_iterator_stop(struct vy_run_iterator *itr)
 			vy_page_delete(itr->prev_page);
 		itr->curr_page = itr->prev_page = NULL;
 	}
+	/* Unpin page_info cache node held by the iterator (see page_info_it). */
+	vy_page_index_array_iterator_close(&itr->page_info_it);
 }
 
 static int
@@ -3164,6 +3166,7 @@ vy_slice_stream_stop(struct vy_stmt_stream *virt_stream)
 		tuple_unref(stream->entry.stmt);
 		stream->entry = vy_entry_none();
 	}
+	vy_page_index_array_iterator_close(&stream->page_info_it);
 }
 
 static void
