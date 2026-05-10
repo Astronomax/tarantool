@@ -31,6 +31,7 @@
 #include "vy_range.h"
 
 #include <assert.h>
+#include "mp_util.h"
 #include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -473,25 +474,27 @@ vy_range_needs_split(struct vy_range *range, int64_t range_size,
 	if (slice->count.bytes < range_size * 4 / 3)
 		return 0;
 
-	/* Find the median key in the oldest run (approximately). */
-	struct vy_page_info mid_page;
-	uint32_t mid_pos = slice->first_page_no +
-		(slice->last_page_no - slice->first_page_no) / 2;
-	if (vy_run_page_info(slice->run, mid_pos, &mid_page) != 0)
-		return -1;
+	/*
+	 * Split key comes from page min_keys copied in vy_slice_new()
+	 * (vy_run_page_info there may yield). We must not yield here:
+	 * vy_range_update_compaction_priority runs between
+	 * vy_lsm_unacct_range and vy_lsm_acct_range.
+	 *
+	 * If the slice has no cached keys (empty slice / empty run),
+	 * skip split.
+	 */
+	if (!slice->has_split_page_keys)
+		return 0;
 
-	struct vy_page_info first_page;
-	if (vy_run_page_info(slice->run, slice->first_page_no,
-			     &first_page) != 0) {
-		vy_page_info_destroy(&mid_page);
-		return -1;
-	}
+	const char *first_min = slice->split_first_min_key;
+	hint_t first_hint = slice->split_first_min_key_hint;
+	const char *mid_min = slice->split_mid_min_key;
+	hint_t mid_hint = slice->split_mid_min_key_hint;
 
 	/* No point in splitting if a new range is going to be empty. */
-	if (vy_key_compare(first_page.min_key, first_page.min_key_hint,
-			   mid_page.min_key, mid_page.min_key_hint,
+	if (vy_key_compare(first_min, first_hint, mid_min, mid_hint,
 			   range->cmp_def) == 0)
-		goto out;
+		return 0;
 	/*
 	 * In extreme cases the median key can be < the beginning
 	 * of the slice, e.g.
@@ -509,24 +512,20 @@ vy_range_needs_split(struct vy_range *range, int64_t range_size,
 	 * In such cases there's no point in splitting the range.
 	 */
 	if (slice->begin.stmt != NULL &&
-	    vy_entry_compare_with_raw_key(slice->begin, mid_page.min_key,
-					  mid_page.min_key_hint,
+	    vy_entry_compare_with_raw_key(slice->begin, mid_min, mid_hint,
 					  range->cmp_def) >= 0)
-		goto out;
+		return 0;
 	/*
 	 * The median key can't be >= the end of the slice as we
 	 * take the min key of a page for the median key.
 	 */
 	assert(slice->end.stmt == NULL ||
-	       vy_entry_compare_with_raw_key(slice->end, mid_page.min_key,
-					     mid_page.min_key_hint,
+	       vy_entry_compare_with_raw_key(slice->end, mid_min, mid_hint,
 					     range->cmp_def) > 0);
-	*p_split_key = mid_page.min_key;
-	mid_page.min_key = NULL;
+	*p_split_key = mp_dup(mid_min);
+	if (*p_split_key == NULL)
+		return -1;
 	*needs_split = true;
-out:
-	vy_page_info_destroy(&mid_page);
-	vy_page_info_destroy(&first_page);
 	return 0;
 }
 

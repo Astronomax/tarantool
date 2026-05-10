@@ -30,6 +30,7 @@
  */
 #include "vy_run.h"
 
+#include <assert.h>
 #include <zstd.h>
 #include <errno.h>
 
@@ -439,7 +440,7 @@ vy_slice_new(int64_t id, struct vy_run *run,
 	} else {
 		if (vy_page_index_find_page(&run->page_index, slice->begin, ITER_GE,
 					    &slice->first_page_no, &unused) != 0)
-			return NULL;
+			goto err_slice;
 		assert(slice->first_page_no < run->info.page_count);
 	}
 	if (slice->end.stmt == NULL) {
@@ -447,7 +448,7 @@ vy_slice_new(int64_t id, struct vy_run *run,
 	} else {
 		if (vy_page_index_find_page(&run->page_index, slice->end, ITER_LT,
 					    &slice->last_page_no, &unused) != 0)
-			return NULL;
+			goto err_slice;
 		if (slice->last_page_no == run->info.page_count) {
 			/* It's an empty slice */
 			slice->first_page_no = 0;
@@ -456,6 +457,37 @@ vy_slice_new(int64_t id, struct vy_run *run,
 		}
 	}
 	assert(slice->last_page_no >= slice->first_page_no);
+	/*
+	 * Page min keys for vy_range_needs_split (must not yield there).
+	 * vy_run_page_info may yield (COIO).
+	 */
+	uint32_t mid_pos = slice->first_page_no +
+		(slice->last_page_no - slice->first_page_no) / 2;
+	struct vy_page_info first_pi, mid_pi;
+	if (vy_run_page_info(run, slice->first_page_no, &first_pi) != 0)
+		goto err_slice;
+	if (vy_run_page_info(run, mid_pos, &mid_pi) != 0) {
+		vy_page_info_destroy(&first_pi);
+		goto err_slice;
+	}
+	hint_t first_hint = first_pi.min_key_hint;
+	hint_t mid_hint = mid_pi.min_key_hint;
+	slice->split_first_min_key = mp_dup(first_pi.min_key);
+	slice->split_mid_min_key = mp_dup(mid_pi.min_key);
+	vy_page_info_destroy(&first_pi);
+	vy_page_info_destroy(&mid_pi);
+	if (slice->split_first_min_key == NULL ||
+	    slice->split_mid_min_key == NULL) {
+		free(slice->split_first_min_key);
+		free(slice->split_mid_min_key);
+		slice->split_first_min_key = NULL;
+		slice->split_mid_min_key = NULL;
+		diag_set(OutOfMemory, 0, "malloc", "mp_dup");
+		goto err_slice;
+	}
+	slice->split_first_min_key_hint = first_hint;
+	slice->split_mid_min_key_hint = mid_hint;
+	slice->has_split_page_keys = true;
 	/** Estimate the number of statements in the slice. */
 	uint32_t run_pages = run->info.page_count;
 	uint32_t slice_pages = slice->last_page_no - slice->first_page_no + 1;
@@ -467,6 +499,9 @@ vy_slice_new(int64_t id, struct vy_run *run,
 	slice->count.bytes_compressed = DIV_ROUND_UP(
 		run->count.bytes_compressed * slice_pages, run_pages);
 	return slice;
+err_slice:
+	vy_slice_delete(slice);
+	return NULL;
 }
 
 void
@@ -476,6 +511,11 @@ vy_slice_delete(struct vy_slice *slice)
 	assert(slice->run->slice_count > 0);
 	slice->run->slice_count--;
 	vy_run_unref(slice->run);
+	if (slice->has_split_page_keys) {
+		free(slice->split_first_min_key);
+		free(slice->split_mid_min_key);
+		slice->has_split_page_keys = false;
+	}
 	if (slice->begin.stmt != NULL)
 		tuple_unref(slice->begin.stmt);
 	if (slice->end.stmt != NULL)

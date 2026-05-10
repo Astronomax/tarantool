@@ -235,6 +235,17 @@ struct vy_slice {
 	uint32_t last_page_no;
 	/** An estimate of the number of statements in this slice. */
 	struct vy_disk_stmt_counter count;
+	/**
+	 * Min keys of the first and median page in the slice span, copied
+	 * into the slice at creation time inside vy_slice_new() (via
+	 * vy_run_page_info, may yield). Used by vy_range_needs_split()
+	 * without yielding.
+	 */
+	bool has_split_page_keys;
+	char *split_first_min_key;
+	hint_t split_first_min_key_hint;
+	char *split_mid_min_key;
+	hint_t split_mid_min_key_hint;
 };
 
 /** Position of a particular stmt in vy_run. */
@@ -508,6 +519,7 @@ vy_run_remove_files(const char *dir, uint32_t space_id,
 /**
  * Allocate a new run slice.
  * This function increments @run->refs.
+ * Loads first/median page min keys for vy_range_needs_split(); may yield.
  */
 struct vy_slice *
 vy_slice_new(int64_t id, struct vy_run *run,
