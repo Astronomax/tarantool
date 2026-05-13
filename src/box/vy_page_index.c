@@ -1794,6 +1794,7 @@ vy_page_index_cache_add_chain(struct vy_page_index_cache *cache,
 			return;
 		}
 		assert(successor == NULL);
+		/* May race with another fiber filling the same cache gap during I/O. */
 		if (replaced != NULL)
 			vy_page_index_cache_node_delete(cache->env, replaced);
 		return;
@@ -1813,6 +1814,7 @@ vy_page_index_cache_add_chain(struct vy_page_index_cache *cache,
 		return;
 	}
 	assert(!vy_page_index_cache_tree_iterator_is_invalid(&inserted));
+	/* May race with another fiber filling the same cache gap during I/O. */
 	if (replaced != NULL)
 		vy_page_index_cache_node_delete(cache->env, replaced);
 
@@ -1845,6 +1847,8 @@ vy_page_index_cache_add_chain(struct vy_page_index_cache *cache,
 	/* There is no such node - insert it. */
 	struct vy_page_index_cache_node *prev_node =
 		vy_page_index_cache_node_new(cache->env, cache, prev);
+	if (prev_node == NULL)
+		return;
 	replaced = NULL;
 	struct vy_page_index_cache_node *successor = NULL;
 	if (vy_page_index_cache_tree_insert(
@@ -1853,8 +1857,11 @@ vy_page_index_cache_add_chain(struct vy_page_index_cache *cache,
 		vy_page_index_cache_node_delete(cache->env, prev_node);
 		return;
 	}
-	assert(replaced == NULL);
-	assert(successor == next_node);
+	/* May race with another fiber filling the same cache gap during I/O. */
+	if (replaced != NULL)
+		vy_page_index_cache_node_delete(cache->env, replaced);
+	else
+		assert(successor == next_node);
 }
 
 /* Find the chain of elements for the given key. */
