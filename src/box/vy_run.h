@@ -281,6 +281,8 @@ struct vy_run_iterator {
 	struct tuple_format *format;
 	/** The run slice to iterate. */
 	struct vy_slice *slice;
+	/** The run kept alive while the iterator holds page index nodes. */
+	struct vy_run *run;
 
 	/* Search options */
 	/**
