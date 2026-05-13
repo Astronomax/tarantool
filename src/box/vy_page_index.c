@@ -2400,51 +2400,58 @@ vy_page_index_array_read_block(struct vy_page_index_array *array,
 		free(offsets);
 		return -1;
 	}
-	size_t region_svp = region_used(&fiber()->gc);
+	/*
+	 * Read the whole block range at once. The offsets point to xlog
+	 * transactions; each page_info payload starts after the transaction
+	 * fixheader and ends at the next transaction offset.
+	 */
+	off_t block_start = (off_t)offsets[0] + XLOG_FIXHEADER_SIZE;
+	off_t block_end = r < array->page_count ?
+			  (off_t)offsets[r - l] : st.st_size;
+	if (block_start >= block_end) {
+		vy_page_index_offsets_invalid_diag_set(
+			array->index_offsets_filepath,
+			"Invalid page_info block offset");
+		goto fail_offsets;
+	}
+	size_t block_size = (size_t)(block_end - block_start);
+	char *data = malloc(block_size);
+	if (data == NULL) {
+		diag_set(OutOfMemory, block_size, "malloc", "page info block");
+		goto fail_offsets;
+	}
+	ssize_t readen = fio_pread(array->index_fd, data, block_size,
+				  block_start);
+	if (readen < 0) {
+		diag_set(SystemError, "failed to read from file");
+		goto fail;
+	}
+	if (array->cache.env != NULL) {
+		pm_atomic_fetch_add(&array->cache.env->io.read_bytes, readen);
+		pm_atomic_fetch_add(&array->cache.env->io.read_ops, 1);
+	}
+	if (readen != (ssize_t)block_size) {
+		vy_page_index_offsets_invalid_diag_set(
+			array->index_offsets_filepath,
+			"Unexpected end of file");
+		goto fail;
+	}
 	for (uint32_t page_no = l; page_no < r; page_no++) {
 		off_t tx_offset = (off_t)offsets[page_no - l];
 		off_t next_tx_offset = page_no + 1 < array->page_count ?
 				       (off_t)offsets[page_no - l + 1] :
 				       st.st_size;
-		/*
-		 * Skip the xlog fixheader to get to the raw xrow
-		 * data. The .index file is written without
-		 * compression, so the payload follows the fixheader
-		 * directly.
-		 */
 		off_t offset = tx_offset + XLOG_FIXHEADER_SIZE;
 		off_t next_offset = next_tx_offset;
-		if (offset >= next_offset) {
+		if (offset < block_start || offset >= next_offset ||
+		    next_offset > block_end) {
 			vy_page_index_offsets_invalid_diag_set(
 				array->index_offsets_filepath,
 				"Invalid page_info offset");
 			goto fail;
 		}
-		size_t size = (size_t)(next_offset - offset);
-		char *data = (char *)region_alloc(&fiber()->gc, size);
-		if (data == NULL) {
-			diag_set(OutOfMemory, size, "region gc", "page info");
-			goto fail;
-		}
-		ssize_t readen =
-			fio_pread(array->index_fd, data, size, offset);
-		if (readen < 0) {
-			diag_set(SystemError, "failed to read from file");
-			goto fail;
-		}
-		if (array->cache.env != NULL) {
-			pm_atomic_fetch_add(&array->cache.env->io.read_bytes,
-					    readen);
-			pm_atomic_fetch_add(&array->cache.env->io.read_ops, 1);
-		}
-		if (readen != (ssize_t)size) {
-			vy_page_index_offsets_invalid_diag_set(
-				array->index_offsets_filepath,
-				"Unexpected end of file");
-			goto fail;
-		}
-		const char *pos = data;
-		const char *end = data + size;
+		const char *pos = data + (offset - block_start);
+		const char *end = data + (next_offset - block_start);
 		struct xrow_header xrow;
 		if (xrow_decode(&xrow, &pos, end, false) != 0 ||
 		    xrow.type != VY_INDEX_PAGE_INFO) {
@@ -2461,13 +2468,14 @@ vy_page_index_array_read_block(struct vy_page_index_array *array,
 			vy_page_info_delete(page);
 			goto fail;
 		}
-		region_truncate(&fiber()->gc, region_svp);
 		result->data[page_no - l] = page;
 	}
+	free(data);
 	free(offsets);
 	return 0;
 fail:
-	region_truncate(&fiber()->gc, region_svp);
+	free(data);
+fail_offsets:
 	free(offsets);
 	vy_page_info_block_destroy(result);
 	return -1;
