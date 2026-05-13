@@ -1624,7 +1624,7 @@ vy_page_index_cache_env_create(struct vy_page_index_cache_env *env,
 	env->tree_mem_used = 0;
 	env->btree_mem_used = 0;
 	env->mem_used = 0;
-	env->mem_quota = 10000;
+	env->mem_quota = 16 * 1024 * 1024;
 	memset(&env->stat, 0, sizeof(env->stat));
 	memset(&env->io, 0, sizeof(env->io));
 	mempool_create(&env->cache_node_mempool, slab_cache,
@@ -1950,7 +1950,7 @@ vy_page_info_cache_env_create(struct vy_page_info_cache_env *env,
 	rlist_create(&env->cache_lru);
 	env->tree_mem_used = 0;
 	env->mem_used = 0;
-	env->mem_quota = 10000;
+	env->mem_quota = 64 * 1024 * 1024;
 	memset(&env->stat, 0, sizeof(env->stat));
 	memset(&env->io, 0, sizeof(env->io));
 	mempool_create(&env->cache_node_mempool, slab_cache,
