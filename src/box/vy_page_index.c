@@ -2114,17 +2114,21 @@ vy_page_info_cache_add_block(struct vy_page_index_array *array,
 	vy_page_info_cache_gc(cache->env);
 
 	/*
-	 * Check if the block was already added to the cache
-	 * (e.g. by another fiber while we were doing I/O).
+	 * Check if the block was already added to the cache (e.g. by another
+	 * fiber while we were doing I/O). Use the tree element comparator here:
+	 * key upper_bound searches by block.r and may find an adjacent block.
 	 */
-	bool unused;
-	*it = vy_page_info_cache_tree_upper_bound(
-		&cache->cache_tree, block->l, &unused);
+	struct vy_page_info_cache_node key_node;
+	memset(&key_node, 0, sizeof(key_node));
+	key_node.block.l = block->l;
+	bool exact = false;
+	*it = vy_page_info_cache_tree_lower_bound_elem(
+		&cache->cache_tree, &key_node, &exact);
 	struct vy_page_info_cache_node **existing =
 		vy_page_info_cache_tree_iterator_get_elem(
 			&cache->cache_tree, it);
-	if (existing != NULL && *existing != NULL &&
-	    (*existing)->block.l == block->l) {
+	if (exact) {
+		assert(existing != NULL && *existing != NULL);
 		*node = *existing;
 		vy_page_info_block_destroy(block);
 		return 0;
@@ -2144,7 +2148,8 @@ vy_page_info_cache_add_block(struct vy_page_index_array *array,
 		vy_page_info_cache_node_delete(cache->env, new_node);
 		return -1;
 	}
-	assert(replaced == NULL);
+	if (replaced != NULL)
+		vy_page_info_cache_node_delete(cache->env, replaced);
 	struct vy_page_info_cache_node **node_ptr =
 		vy_page_info_cache_tree_iterator_get_elem(
 			&cache->cache_tree, it);
