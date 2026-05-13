@@ -1,6 +1,8 @@
 #ifndef INCLUDES_TARANTOOL_BOX_VY_PAGE_INDEX_H
 #define INCLUDES_TARANTOOL_BOX_VY_PAGE_INDEX_H
 
+#include <stdbool.h>
+
 #include "key_def.h"
 #include "iterator_type.h"
 #include "vy_stmt.h"
@@ -325,6 +327,9 @@ struct vy_page_index_array_iterator {
 	uint32_t page_no;
 };
 
+void
+vy_page_info_block_destroy(struct vy_page_info_block *block);
+
 struct vy_page_index_array_iterator
 vy_page_index_array_invalid_iterator(void);
 
@@ -344,6 +349,11 @@ vy_page_index_array_iterator_get(struct vy_page_index_array_iterator *it);
 
 void
 vy_page_index_array_iterator_close(struct vy_page_index_array_iterator *it);
+
+int
+vy_page_index_read_page_info_block(struct vy_page_index *index,
+				   uint32_t block_idx,
+				   struct vy_page_info_block *result);
 
 int
 vy_page_index_recover(struct vy_page_index *index,

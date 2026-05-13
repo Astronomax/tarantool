@@ -627,7 +627,8 @@ struct vy_slice_stream {
 	/** Current position */
 	uint32_t page_no;
 	uint32_t pos_in_page;
-	struct vy_page_index_array_iterator page_info_it;
+	struct vy_page_info_block page_info_block;
+	bool has_page_info_block;
 	/** Last page read */
 	struct vy_page *page;
 	/** The last tuple returned to user */

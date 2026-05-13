@@ -32,9 +32,6 @@
 
 const float VY_BTREE_MEMORY_FACTOR = 0.5;
 
-static void
-vy_page_info_block_destroy(struct vy_page_info_block *block);
-
 static int
 vy_page_index_btree_find_chain(struct vy_page_index_btree *btree,
 			       struct vy_entry key, bool lower_bound,
@@ -2173,7 +2170,7 @@ vy_page_info_cache_add_block(struct vy_page_index_array *array,
  * 2. Read the page info block from the .index file.
  */
 
-static void
+void
 vy_page_info_block_destroy(struct vy_page_info_block *block)
 {
 	assert(block->r >= block->l);
@@ -2476,6 +2473,17 @@ fail:
 	free(offsets);
 	vy_page_info_block_destroy(result);
 	return -1;
+}
+
+int
+vy_page_index_read_page_info_block(struct vy_page_index *index,
+				   uint32_t block_idx,
+				   struct vy_page_info_block *result)
+{
+	if (vy_page_index_array_open(&index->page_info) != 0)
+		return -1;
+	return vy_page_index_array_read_block(&index->page_info, block_idx,
+					      result);
 }
 
 struct vy_page_index_array_iterator

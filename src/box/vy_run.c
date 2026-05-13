@@ -3011,6 +3011,33 @@ vy_run_remove_files(const char *dir, uint32_t space_id,
 }
 
 /**
+ * Get page info with a block cache local to the slice stream. Compaction runs
+ * in a worker thread, so it must not mutate the shared page-info cache.
+ */
+static NODISCARD struct vy_page_info *
+vy_slice_stream_page_info(struct vy_slice_stream *stream)
+{
+	if (!stream->has_page_info_block ||
+	    stream->page_no < stream->page_info_block.l ||
+	    stream->page_no >= stream->page_info_block.r) {
+		if (stream->has_page_info_block)
+			vy_page_info_block_destroy(&stream->page_info_block);
+		uint32_t block_idx = stream->page_no / VY_PAGE_INFO_BLOCK;
+		if (vy_page_index_read_page_info_block(
+		    &stream->slice->run->page_index, block_idx,
+		    &stream->page_info_block) != 0) {
+			stream->has_page_info_block = false;
+			return NULL;
+		}
+		stream->has_page_info_block = true;
+	}
+	assert(stream->page_info_block.l <= stream->page_no &&
+	       stream->page_no < stream->page_info_block.r);
+	return stream->page_info_block.data[
+		stream->page_no - stream->page_info_block.l];
+}
+
+/**
  * Read a page with stream->page_no from the run and save it in stream->page.
  * Support function of slice stream.
  * @param stream - the stream.
@@ -3026,8 +3053,9 @@ vy_slice_stream_read_page(struct vy_slice_stream *stream)
 	if (zdctx == NULL)
 		return -1;
 
-	struct vy_page_info *page_info =
-		vy_page_index_array_iterator_get(&stream->page_info_it);
+	struct vy_page_info *page_info = vy_slice_stream_page_info(stream);
+	if (page_info == NULL)
+		return -1;
 	stream->page = vy_page_new(page_info);
 	if (stream->page == NULL)
 		return -1;
@@ -3076,9 +3104,8 @@ vy_slice_stream_search(struct vy_stmt_stream *virt_stream)
 		vy_page_delete(stream->page);
 		stream->page = NULL;
 		stream->page_no++;
-		if (vy_page_index_array_iterator_next(
-		    &stream->slice->run->page_index.page_info,
-		    &stream->page_info_it) != 0)
+		if (stream->page_no <= stream->slice->last_page_no &&
+		    vy_slice_stream_page_info(stream) == NULL)
 			return -1;
 		stream->pos_in_page = 0;
 	}
@@ -3133,8 +3160,9 @@ vy_slice_stream_next(struct vy_stmt_stream *virt_stream, struct vy_entry *ret)
 	stream->pos_in_page++;
 
 	/* Check whether the position is out of page */
-	struct vy_page_info *page_info =
-		vy_page_index_array_iterator_get(&stream->page_info_it);
+	struct vy_page_info *page_info = vy_slice_stream_page_info(stream);
+	if (page_info == NULL)
+		return -1;
 	if (stream->pos_in_page >= page_info->row_count) {
 		/**
 		 * Out of page. Free page, move the position to the next page
@@ -3143,9 +3171,8 @@ vy_slice_stream_next(struct vy_stmt_stream *virt_stream, struct vy_entry *ret)
 		vy_page_delete(stream->page);
 		stream->page = NULL;
 		stream->page_no++;
-		if (vy_page_index_array_iterator_next(
-		    &stream->slice->run->page_index.page_info,
-		    &stream->page_info_it) != 0)
+		if (stream->page_no <= stream->slice->last_page_no &&
+		    vy_slice_stream_page_info(stream) == NULL)
 			return -1;
 		stream->pos_in_page = 0;
 	}
@@ -3169,7 +3196,10 @@ vy_slice_stream_stop(struct vy_stmt_stream *virt_stream)
 		tuple_unref(stream->entry.stmt);
 		stream->entry = vy_entry_none();
 	}
-	vy_page_index_array_iterator_close(&stream->page_info_it);
+	if (stream->has_page_info_block) {
+		vy_page_info_block_destroy(&stream->page_info_block);
+		stream->has_page_info_block = false;
+	}
 }
 
 static void
@@ -3193,17 +3223,17 @@ vy_slice_stream_open(struct vy_slice_stream *stream, struct vy_slice *slice,
 {
 	stream->base.iface = &vy_slice_stream_iface;
 
+	stream->slice = slice;
+	stream->cmp_def = cmp_def;
 	stream->page_no = slice->first_page_no;
-	stream->page_info_it = vy_page_index_array_invalid_iterator();
-	if (vy_page_index_get_page(&slice->run->page_index, stream->page_no,
-				   &stream->page_info_it) != 0)
+	memset(&stream->page_info_block, 0, sizeof(stream->page_info_block));
+	stream->has_page_info_block = false;
+	if (vy_slice_stream_page_info(stream) == NULL)
 		return -1;
 	stream->pos_in_page = 0; /* We'll find it later */
 	stream->page = NULL;
 	stream->entry = vy_entry_none();
 
-	stream->slice = slice;
-	stream->cmp_def = cmp_def;
 	stream->format = format;
 	tuple_format_ref(format);
 	return 0;
