@@ -102,26 +102,6 @@ enum vy_page_index_btree_node_type {
 
 #define VY_PAGE_INDEX_BTREE_MAX_DEPTH 32
 
-struct vy_page_index_btree_path_entry {
-	/* TODO: Store node in every entry to read each node only once. */
-	uint64_t node_offset;
-	uint32_t key_count;
-	uint32_t child;
-};
-
-struct vy_page_index_btree_iterator {
-	/** File offset of the node that contains the element. */
-	uint64_t node_offset;
-	/** Index inside node->keys[]. */
-	uint32_t pos;
-	/**
-	 * Path from root to the current node (excluding the current node).
-	 * Each entry describes from which child of the parent we descended.
-	 */
-	uint32_t depth;
-	struct vy_page_index_btree_path_entry path[VY_PAGE_INDEX_BTREE_MAX_DEPTH];
-};
-
 /**
  * B-tree node structure.
  * Internal nodes also contain data (vy_page_index_entry).
@@ -152,6 +132,33 @@ struct vy_page_index_btree_node {
 	bool borrowed;
 	/** Offset of this node in the file. */
 	uint64_t offset;
+};
+
+/** Ancestor on the iterator path (ownership transferred via move). */
+struct vy_page_index_btree_path_entry {
+	struct vy_page_index_btree_node node;
+	/** Index of the child we descended into in @a node. */
+	uint32_t child;
+};
+
+struct vy_page_index_btree_iterator {
+	/** File offset of the node that contains the element. */
+	uint64_t node_offset;
+	/** Index inside node->keys[]. */
+	uint32_t pos;
+	/**
+	 * Owned leaf node after lower/upper bound or last(). Reused by next/prev
+	 * while the iterator stays inside the same leaf.
+	 */
+	bool has_current_node;
+	struct vy_page_index_btree_node current_node;
+	/**
+	 * Path from root to the current node (excluding the current node).
+	 * Each entry is the parent node and the child index we descended into.
+	 * Nodes are moved into the path on descent, never copied.
+	 */
+	uint32_t depth;
+	struct vy_page_index_btree_path_entry path[VY_PAGE_INDEX_BTREE_MAX_DEPTH];
 };
 
 /** Memory owned by the in-memory .btree subtree rooted at @a node. */
@@ -194,16 +201,6 @@ vy_page_index_entry_copy(struct vy_page_index_entry *entry)
 	return result;
 }
 
-static struct vy_page_index_entry
-vy_page_index_entry_move(struct vy_page_index_entry *entry)
-{
-	struct vy_page_index_entry result = *entry;
-	entry->idx = 0;
-	entry->min_key = NULL;
-	entry->min_key_hint = HINT_NONE;
-	return result;
-}
-
 static void
 vy_page_index_entry_destroy(struct vy_page_index_entry *entry)
 {
@@ -239,6 +236,15 @@ vy_page_index_btree_node_destroy(struct vy_page_index_btree_node *node)
 		free(node->children.offsets);
 	}
 	TRASH(node);
+}
+
+static struct vy_page_index_btree_node
+vy_page_index_btree_node_move(struct vy_page_index_btree_node *node)
+{
+	struct vy_page_index_btree_node result = *node;
+	memset(node, 0, sizeof(*node));
+	node->borrowed = true;
+	return result;
 }
 
 MAYBE_UNUSED static struct vy_page_index_btree *
@@ -837,15 +843,81 @@ vy_page_index_btree_invalid_iterator(void)
 	return (struct vy_page_index_btree_iterator){
 		.node_offset = UINT64_MAX,
 		.pos = 0,
+		.has_current_node = false,
 		.depth = 0,
 	};
 }
 
 static inline bool
-vy_page_index_btree_iterator_is_invalid(struct vy_page_index_btree_iterator *it)
+vy_page_index_btree_iterator_is_invalid(const struct vy_page_index_btree_iterator *it)
 {
 	return it->node_offset == UINT64_MAX;
 }
+
+static inline void
+vy_page_index_btree_iterator_assert_current_node(
+	const struct vy_page_index_btree_iterator *it)
+{
+	assert(!vy_page_index_btree_iterator_is_invalid(it));
+	assert(it->has_current_node);
+	assert(it->current_node.offset == it->node_offset);
+	(void)it;
+}
+
+static void
+vy_page_index_btree_iterator_clear_current_node(
+	struct vy_page_index_btree_iterator *it)
+{
+	if (it->has_current_node) {
+		vy_page_index_btree_node_destroy(&it->current_node);
+		it->has_current_node = false;
+	}
+}
+
+static void
+vy_page_index_btree_iterator_clear_path(
+	struct vy_page_index_btree_iterator *it)
+{
+	for (uint32_t i = 0; i < it->depth; i++)
+		vy_page_index_btree_node_destroy(&it->path[i].node);
+	it->depth = 0;
+}
+
+/* Destroy the iterator. It also invalidates the iterator. */
+static void
+vy_page_index_btree_iterator_destroy(struct vy_page_index_btree_iterator *it)
+{
+	vy_page_index_btree_iterator_clear_current_node(it);
+	vy_page_index_btree_iterator_clear_path(it);
+	*it = vy_page_index_btree_invalid_iterator();
+}
+
+/** Detach the cached current node for next/prev (ownership moves to @a node). */
+static void
+vy_page_index_btree_iterator_take_node(struct vy_page_index_btree_iterator *it,
+				       struct vy_page_index_btree_node *node)
+{
+	vy_page_index_btree_iterator_assert_current_node(it);
+	*node = vy_page_index_btree_node_move(&it->current_node);
+	it->has_current_node = false;
+}
+
+/** Load the current node from disk if it is not cached yet. */
+/*static int
+vy_page_index_btree_iterator_ensure_current_node(
+	struct vy_page_index_btree *btree,
+	struct vy_page_index_btree_iterator *it)
+{
+	if (it->has_current_node)
+		return 0;
+	if (vy_page_index_btree_node_read(btree, &it->current_node,
+					  it->node_offset) != 0) {
+		vy_page_index_btree_iterator_destroy(it);
+		return -1;
+	}
+	it->has_current_node = true;
+	return 0;
+}*/
 
 static int
 vy_page_index_btree_iterator_get_elem(struct vy_page_index_btree *btree,
@@ -858,16 +930,19 @@ vy_page_index_btree_iterator_get_elem(struct vy_page_index_btree *btree,
 		result->min_key_hint = HINT_NONE;
 		return 0;
 	}
-	struct vy_page_index_btree_node node;
-	/**
-	 * The iterator always reads the node from disk for now.
-	 * But we have several levels of the tree in memory.
-	 * TODO: use cached nodes if possible.
-	 */
-	if (vy_page_index_btree_node_read(btree, &node, it->node_offset) != 0)
-		return -1;
-	*result = vy_page_index_entry_move(&node.keys[it->pos]);
-	vy_page_index_btree_node_destroy(&node);
+	/* Use the cached node when available, otherwise read from disk. */
+	if (!it->has_current_node) {
+		struct vy_page_index_btree_node node;
+		if (vy_page_index_btree_node_read(btree, &node, it->node_offset) != 0)
+			return -1;
+		assert(it->pos < node.key_count);
+		*result = vy_page_index_entry_copy(&node.keys[it->pos]);
+		vy_page_index_btree_node_destroy(&node);
+		return 0;
+	}
+	vy_page_index_btree_iterator_assert_current_node(it);
+	assert(it->pos < it->current_node.key_count);
+	*result = vy_page_index_entry_copy(&it->current_node.keys[it->pos]);
 	return 0;
 }
 
@@ -877,18 +952,20 @@ vy_page_index_invalid_diag_set(const char *filename, const char *message)
 	diag_set(ClientError, ER_INVALID_INDEX_FILE, filename, message);
 }
 
-/* Push a path entry to the iterator. */
+/* Push a path entry to the iterator. Takes ownership of @a node. */
 static inline int
 vy_page_index_btree_path_push(struct vy_page_index_btree *btree,
 			      struct vy_page_index_btree_iterator *it,
-			      struct vy_page_index_btree_path_entry entry)
+			      struct vy_page_index_btree_node *node,
+			      uint32_t child)
 {
 	if (it->depth >= VY_PAGE_INDEX_BTREE_MAX_DEPTH) {
 		vy_page_index_invalid_diag_set(
 			btree->filepath, "B-tree depth limit exceeded");
 		return -1;
 	}
-	it->path[it->depth] = entry;
+	it->path[it->depth].node = vy_page_index_btree_node_move(node);
+	it->path[it->depth].child = child;
 	++it->depth;
 	return 0;
 }
@@ -905,9 +982,11 @@ vy_page_index_btree_iterator_descend_min(struct vy_page_index_btree *btree,
 	struct vy_page_index_btree_node node = *start;
 	while (true) {
 		if (node.type == VY_PAGE_INDEX_BTREE_NODE_LEAF) {
+			vy_page_index_btree_iterator_clear_current_node(it);
 			it->node_offset = node.offset;
 			it->pos = 0;
-			vy_page_index_btree_node_destroy(&node);
+			it->current_node = vy_page_index_btree_node_move(&node);
+			it->has_current_node = true;
 			return 0;
 		}
 		uint32_t child = 0;
@@ -917,14 +996,9 @@ vy_page_index_btree_iterator_descend_min(struct vy_page_index_btree *btree,
 			vy_page_index_btree_node_destroy(&node);
 			return -1;
 		}
-		struct vy_page_index_btree_path_entry entry = {
-			.node_offset = node.offset,
-			.key_count = node.key_count,
-			.child = child
-		};
-		/* The parent is not used anymore. */
-		vy_page_index_btree_node_destroy(&node);
-		if (vy_page_index_btree_path_push(btree, it, entry) != 0) {
+		/* The parent is moved into the path and not used anymore. */
+		if (vy_page_index_btree_path_push(btree, it, &node, child) != 0) {
+			vy_page_index_btree_node_destroy(&node);
 			vy_page_index_btree_node_destroy(&child_node);
 			return -1;
 		}
@@ -944,9 +1018,11 @@ vy_page_index_btree_iterator_descend_max(struct vy_page_index_btree *btree,
 	struct vy_page_index_btree_node node = *start;
 	while (true) {
 		if (node.type == VY_PAGE_INDEX_BTREE_NODE_LEAF) {
+			vy_page_index_btree_iterator_clear_current_node(it);
 			it->node_offset = node.offset;
 			it->pos = node.key_count - 1;
-			vy_page_index_btree_node_destroy(&node);
+			it->current_node = vy_page_index_btree_node_move(&node);
+			it->has_current_node = true;
 			return 0;
 		}
 		uint32_t child = node.key_count;
@@ -956,13 +1032,9 @@ vy_page_index_btree_iterator_descend_max(struct vy_page_index_btree *btree,
 			vy_page_index_btree_node_destroy(&node);
 			return -1;
 		}
-		struct vy_page_index_btree_path_entry entry = {
-			.node_offset = node.offset,
-			.key_count = node.key_count,
-			.child = child
-		};
-		vy_page_index_btree_node_destroy(&node);
-		if (vy_page_index_btree_path_push(btree, it, entry) != 0) {
+		/* The parent is moved into the path and not used anymore. */
+		if (vy_page_index_btree_path_push(btree, it, &node, child) != 0) {
+			vy_page_index_btree_node_destroy(&node);
 			vy_page_index_btree_node_destroy(&child_node);
 			return -1;
 		}
@@ -977,39 +1049,35 @@ vy_page_index_btree_iterator_next(struct vy_page_index_btree *btree,
 	if (vy_page_index_btree_iterator_is_invalid(it))
 		return 0;
 
-	struct vy_page_index_btree_node node;
-	if (vy_page_index_btree_node_read(btree, &node, it->node_offset) != 0) {
-		*it = vy_page_index_btree_invalid_iterator();
-		return -1;
-	}
+	vy_page_index_btree_iterator_assert_current_node(it);
+	//if (vy_page_index_btree_iterator_ensure_current_node(btree, it) != 0)
+	//	return -1;
+
+	struct vy_page_index_btree_node node = it->current_node;
 
 	if (node.type == VY_PAGE_INDEX_BTREE_NODE_INTERNAL) {
-		/* Go down to child. */
+		/* This node is not more needed for iterator, so we can move it. */
+		vy_page_index_btree_iterator_take_node(it, &node);
+		/* Go down to the right sibling subtree. */
 		uint32_t child = it->pos + 1;
 		assert(child <= node.key_count);
 		struct vy_page_index_btree_node child_node;
 		if (vy_page_index_btree_node_get_child(
 		    btree, &node, child, &child_node) != 0) {
 			vy_page_index_btree_node_destroy(&node);
-			*it = vy_page_index_btree_invalid_iterator();
+			vy_page_index_btree_iterator_destroy(it);
 			return -1;
 		}
-		struct vy_page_index_btree_path_entry entry = {
-			.node_offset = it->node_offset,
-			.key_count = node.key_count,
-			.child = child
-		};
-		/* The parent is not used anymore. */
-		vy_page_index_btree_node_destroy(&node);
-		if (vy_page_index_btree_path_push(btree, it, entry) != 0) {
+		if (vy_page_index_btree_path_push(btree, it, &node, child) != 0) {
+			vy_page_index_btree_node_destroy(&node);
 			vy_page_index_btree_node_destroy(&child_node);
-			*it = vy_page_index_btree_invalid_iterator();
+			vy_page_index_btree_iterator_destroy(it);
 			return -1;
 		}
-		/* Descent left to next minimum >= current. */
+		/* Descent left to the minimum >= current. */
 		if (vy_page_index_btree_iterator_descend_min(
 		    btree, it, &child_node) != 0) {
-			*it = vy_page_index_btree_invalid_iterator();
+			vy_page_index_btree_iterator_destroy(it);
 			return -1;
 		}
 		return 0;
@@ -1017,25 +1085,29 @@ vy_page_index_btree_iterator_next(struct vy_page_index_btree *btree,
 
 	/* Leaf. */
 	uint32_t key_count = node.key_count;
-	vy_page_index_btree_node_destroy(&node);
-
 	if (it->pos + 1 < key_count) {
 		++it->pos;
 		return 0;
 	}
 
+	/* This node is not more needed for iterator. */
+	vy_page_index_btree_iterator_clear_current_node(it);
+
 	/* Ascend. */
 	while (it->depth > 0) {
-		struct vy_page_index_btree_path_entry entry =
-			it->path[it->depth - 1];
-		--it->depth;
-		if (entry.child < entry.key_count) {
-			it->node_offset = entry.node_offset;
-			it->pos = entry.child;
+		struct vy_page_index_btree_path_entry *entry =
+			&it->path[--it->depth];
+		if (entry->child < entry->node.key_count) {
+			it->node_offset = entry->node.offset;
+			it->pos = entry->child;
+			it->current_node = vy_page_index_btree_node_move(
+				&entry->node);
+			it->has_current_node = true;
 			return 0;
 		}
+		vy_page_index_btree_node_destroy(&entry->node);
 	}
-	*it = vy_page_index_btree_invalid_iterator();
+	vy_page_index_btree_iterator_destroy(it);
 	return 0;
 }
 
@@ -1046,63 +1118,64 @@ vy_page_index_btree_iterator_prev(struct vy_page_index_btree *btree,
 	if (vy_page_index_btree_iterator_is_invalid(it))
 		return 0;
 
-	struct vy_page_index_btree_node node;
-	if (vy_page_index_btree_node_read(btree, &node, it->node_offset) != 0) {
-		*it = vy_page_index_btree_invalid_iterator();
-		return -1;
-	}
+	vy_page_index_btree_iterator_assert_current_node(it);
+	//if (vy_page_index_btree_iterator_ensure_current_node(btree, it) != 0)
+	//	return -1;
+
+	struct vy_page_index_btree_node node = it->current_node;
 
 	if (node.type == VY_PAGE_INDEX_BTREE_NODE_INTERNAL) {
-		/* Go down to child. */
+		/* This node is not more needed for iterator, so we can move it. */
+		vy_page_index_btree_iterator_take_node(it, &node);
+		/* Go down to the left sibling subtree. */
 		uint32_t child = it->pos;
 		assert(child <= node.key_count);
 		struct vy_page_index_btree_node child_node;
 		if (vy_page_index_btree_node_get_child(
 		    btree, &node, child, &child_node) != 0) {
 			vy_page_index_btree_node_destroy(&node);
-			*it = vy_page_index_btree_invalid_iterator();
+			vy_page_index_btree_iterator_destroy(it);
 			return -1;
 		}
-		struct vy_page_index_btree_path_entry entry = {
-			.node_offset = it->node_offset,
-			.key_count = node.key_count,
-			.child = child
-		};
-		vy_page_index_btree_node_destroy(&node);
-		if (vy_page_index_btree_path_push(btree, it, entry) != 0) {
+		if (vy_page_index_btree_path_push(btree, it, &node, child) != 0) {
+			vy_page_index_btree_node_destroy(&node);
 			vy_page_index_btree_node_destroy(&child_node);
-			*it = vy_page_index_btree_invalid_iterator();
+			vy_page_index_btree_iterator_destroy(it);
 			return -1;
 		}
-		/* Descent right to next maximum <= current. */
+		/* Descent right to the maximum <= current. */
 		if (vy_page_index_btree_iterator_descend_max(
 		    btree, it, &child_node) != 0) {
-			*it = vy_page_index_btree_invalid_iterator();
+			vy_page_index_btree_iterator_destroy(it);
 			return -1;
 		}
 		return 0;
 	}
 
 	/* Leaf. */
-	vy_page_index_btree_node_destroy(&node);
-
 	if (it->pos > 0) {
 		--it->pos;
 		return 0;
 	}
 
+	/* This node is not more needed for iterator. */
+	vy_page_index_btree_iterator_clear_current_node(it);
+
 	/* Ascend. */
 	while (it->depth > 0) {
-		struct vy_page_index_btree_path_entry entry =
-			it->path[it->depth - 1];
-		--it->depth;
-		if (entry.child > 0) {
-			it->node_offset = entry.node_offset;
-			it->pos = entry.child - 1;
+		struct vy_page_index_btree_path_entry *entry =
+			&it->path[--it->depth];
+		if (entry->child > 0) {
+			it->node_offset = entry->node.offset;
+			it->pos = entry->child - 1;
+			it->current_node = vy_page_index_btree_node_move(
+				&entry->node);
+			it->has_current_node = true;
 			return 0;
 		}
+		vy_page_index_btree_node_destroy(&entry->node);
 	}
-	*it = vy_page_index_btree_invalid_iterator();
+	vy_page_index_btree_iterator_destroy(it);
 	return 0;
 }
 
@@ -1162,16 +1235,13 @@ vy_page_index_btree_lower_bound(struct vy_page_index_btree *btree,
 	*equal_key = false;
 	*result = vy_page_index_btree_invalid_iterator();
 
-	struct vy_page_index_btree_iterator it = {
-		.pos = 0,
-		.depth = 0
-	};
-
 	struct vy_page_index_btree_node node;
 	if (vy_page_index_btree_node_get_root(btree, &node) != 0) {
 		*result = vy_page_index_btree_invalid_iterator();
 		return -1;
 	}
+
+	int64_t found_depth = -1;
 
 	/* Descend. */
 	while (true) {
@@ -1180,39 +1250,49 @@ vy_page_index_btree_lower_bound(struct vy_page_index_btree *btree,
 			btree, &node, key, &eq);
 		*equal_key = *equal_key || eq;
 
-		if (child < node.key_count) {
-			result->depth = it.depth;
-			memcpy(result->path, it.path,
-			       (size_t)it.depth * sizeof(it.path[0]));
-			result->node_offset = node.offset;
-			result->pos = child;
-		}
-
 		if (node.type == VY_PAGE_INDEX_BTREE_NODE_LEAF) {
-			vy_page_index_btree_node_destroy(&node);
+			if (child < node.key_count) {
+				result->node_offset = node.offset;
+				result->pos = child;
+				result->has_current_node = true;
+				result->current_node =
+					vy_page_index_btree_node_move(&node);
+			} else {
+				/* All keys in the leaf are < @a key. */
+				if (found_depth != -1) {
+					result->has_current_node = true;
+					result->current_node = result->path[found_depth].node;
+					for (int i = result->depth; i < found_depth; i++)
+						vy_page_index_btree_node_destroy(&result->path[i].node);
+					result->depth = found_depth;
+				}
+				vy_page_index_btree_node_destroy(&node);
+			}
 			return 0;
 		}
-		struct vy_page_index_btree_path_entry entry = {
-			.node_offset = node.offset,
-			.key_count = node.key_count,
-			.child = child
-		};
+
+		if (child < node.key_count) {
+			result->node_offset = node.offset;
+			result->pos = child;
+			found_depth = result->depth;
+		}
+
 		struct vy_page_index_btree_node child_node;
 		if (vy_page_index_btree_node_get_child(
 		    btree, &node, child, &child_node) != 0) {
 			vy_page_index_btree_node_destroy(&node);
-			*result = vy_page_index_btree_invalid_iterator();
-			return -1;
+			goto fail;
 		}
-		vy_page_index_btree_node_destroy(&node);
-
-		if (vy_page_index_btree_path_push(btree, &it, entry) != 0) {
+		if (vy_page_index_btree_path_push(btree, result, &node, child) != 0) {
+			vy_page_index_btree_node_destroy(&node);
 			vy_page_index_btree_node_destroy(&child_node);
-			*result = vy_page_index_btree_invalid_iterator();
-			return -1;
+			goto fail;
 		}
 		node = child_node;
 	}
+fail:
+	vy_page_index_btree_iterator_destroy(result);
+	return -1;
 }
 
 static int
@@ -1224,56 +1304,64 @@ vy_page_index_btree_upper_bound(struct vy_page_index_btree *btree,
 	*equal_key = false;
 	*result = vy_page_index_btree_invalid_iterator();
 
-	struct vy_page_index_btree_iterator it = {
-		.pos = 0,
-		.depth = 0
-	};
-
 	struct vy_page_index_btree_node node;
 	if (vy_page_index_btree_node_get_root(btree, &node) != 0) {
 		*result = vy_page_index_btree_invalid_iterator();
 		return -1;
 	}
 
+	int64_t found_depth = -1;
+
+	/* Descend. */
 	while (true) {
 		bool eq = false;
 		uint32_t child = vy_page_index_btree_node_upper_bound(
 			btree, &node, key, &eq);
 		*equal_key = *equal_key || eq;
 
-		if (child < node.key_count) {
-			result->depth = it.depth;
-			memcpy(result->path, it.path,
-			       (size_t)it.depth * sizeof(it.path[0]));
-			result->node_offset = node.offset;
-			result->pos = child;
-		}
-
 		if (node.type == VY_PAGE_INDEX_BTREE_NODE_LEAF) {
-			vy_page_index_btree_node_destroy(&node);
+			if (child < node.key_count) {
+				result->node_offset = node.offset;
+				result->pos = child;
+				result->has_current_node = true;
+				result->current_node =
+					vy_page_index_btree_node_move(&node);
+			} else {
+				/* All keys in the leaf are > @a key. */
+				if (found_depth != -1) {
+					result->has_current_node = true;
+					result->current_node = result->path[found_depth].node;
+					for (int i = result->depth; i < found_depth; i++)
+						vy_page_index_btree_node_destroy(&result->path[i].node);
+					result->depth = found_depth;
+				}
+				vy_page_index_btree_node_destroy(&node);
+			}
 			return 0;
 		}
-		struct vy_page_index_btree_path_entry entry = {
-			.node_offset = node.offset,
-			.key_count = node.key_count,
-			.child = child
-		};
+
+		if (child < node.key_count) {
+			result->node_offset = node.offset;
+			result->pos = child;
+			found_depth = result->depth;
+		}
+
 		struct vy_page_index_btree_node child_node;
 		if (vy_page_index_btree_node_get_child(
 		    btree, &node, child, &child_node) != 0) {
 			vy_page_index_btree_node_destroy(&node);
-			*result = vy_page_index_btree_invalid_iterator();
-			return -1;
+			goto fail;
 		}
-		vy_page_index_btree_node_destroy(&node);
-
-		if (vy_page_index_btree_path_push(btree, &it, entry) != 0) {
+		if (vy_page_index_btree_path_push(btree, result, &node, child) != 0) {
+			vy_page_index_btree_node_destroy(&node);
 			vy_page_index_btree_node_destroy(&child_node);
-			*result = vy_page_index_btree_invalid_iterator();
-			return -1;
+			goto fail;
 		}
 		node = child_node;
 	}
+fail:
+	vy_page_index_btree_iterator_destroy(result);
+	return -1;
 }
 
 /* Find the last element in the tree. */
@@ -1320,6 +1408,7 @@ vy_page_index_btree_find_chain(struct vy_page_index_btree *btree,
 		next->idx = btree->page_count;
 		next->min_key = NULL;
 		next->min_key_hint = HINT_NONE;
+		vy_page_index_btree_iterator_destroy(&it);
 		if (vy_page_index_btree_last(btree, &it) != 0)
 			goto fail;
 	} else {
@@ -1337,8 +1426,10 @@ vy_page_index_btree_find_chain(struct vy_page_index_btree *btree,
 
 out:
 	assert(prev->idx != INT32_MAX);
+	vy_page_index_btree_iterator_destroy(&it);
 	return 0;
 fail:
+	vy_page_index_btree_iterator_destroy(&it);
 	return -1;
 }
 
@@ -1828,9 +1919,10 @@ vy_page_index_cache_add_chain(struct vy_page_index_cache *cache,
 		assert(*prev_check_node != NULL);
 		struct vy_page_index_entry *prev_check =
 			&(*prev_check_node)->entry;
-
+#ifndef NDEBUG
 		int cmp = vy_page_index_entry_compare(prev_check, prev,
 						      cache->cmp_def);
+#endif
 		assert(cmp <= 0);
 		if (prev_check->idx + 1 == next->idx) {
 			/* The found node must be exactly prev. */
