@@ -66,6 +66,10 @@ vy_page_index_btree_find_cb(struct cbus_call_msg *base)
 	task->equal_key = false;
 	memset(&task->next, 0, sizeof(task->next));
 	memset(&task->prev, 0, sizeof(task->prev));
+	/*
+	 * The caller must open and preload the shared B-tree before COIO.
+	 * The callback may only read from disk and use immutable B-tree state.
+	 */
 	return vy_page_index_btree_find_chain(task->btree, task->key,
 					      task->lower_bound,
 					      &task->next, &task->prev,
@@ -1292,6 +1296,7 @@ vy_page_index_btree_last(struct vy_page_index_btree *btree,
 /**
  * Find the chain of elements for the given key.
  * A chain is a pair of consecutive elements.
+ * The B-tree must be opened by the caller before this function is used.
  */
 static int
 vy_page_index_btree_find_chain(struct vy_page_index_btree *btree,
@@ -1300,8 +1305,8 @@ vy_page_index_btree_find_chain(struct vy_page_index_btree *btree,
 			       struct vy_page_index_entry *prev,
 			       bool *equal_key)
 {
-	if (vy_page_index_btree_open(btree) != 0)
-		return -1;
+	assert(btree->fd >= 0);
+	assert(btree->in_memory_depth == 0 || btree->root != NULL);
 
 	struct vy_page_index_btree_iterator it;
 	if (lower_bound) {
@@ -2529,6 +2534,7 @@ vy_page_index_array_read_block_to_cache(struct vy_page_index_array *array,
 	memset(&task, 0, sizeof(task));
 	task.array = array;
 	task.block_idx = block_idx;
+	/* The COIO callback reads from disk; cache insertion stays here. */
 	if (vy_run_env_coio_call(array->cache.env->run_env, &task.base,
 				 vy_page_info_block_read_cb) != 0)
 		return -1;
@@ -2839,7 +2845,7 @@ vy_page_index_find_page(struct vy_page_index *index, struct vy_entry key,
 	if (hit)
 		goto out;
 
-	/* Miss. Go to disk. */
+	/* Miss. Open/preload shared state before the disk-only COIO lookup. */
 	if (vy_page_index_btree_open(&index->btree) != 0)
 		return -1;
 	struct vy_page_index_btree_find_task task;
@@ -2862,6 +2868,7 @@ vy_page_index_find_page(struct vy_page_index *index, struct vy_entry key,
 		return -1;
 	}
 
+	/* Cache is checked and updated only by the caller, after COIO returns. */
 	vy_page_index_cache_add_chain(&index->cache, &next, &prev);
 
 out:
