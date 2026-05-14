@@ -30,8 +30,6 @@
 
 #define XLOG_META_TYPE_INDEX "INDEX"
 
-const float VY_BTREE_MEMORY_FACTOR = 0.5;
-
 static int
 vy_page_index_btree_find_chain(struct vy_page_index_btree *btree,
 			       struct vy_entry key, bool lower_bound,
@@ -285,8 +283,8 @@ vy_page_index_btree_create(struct vy_page_index_btree *btree,
 	for (uint64_t n = page_count; n > 0;
 	     n /= VY_PAGE_INDEX_BTREE_ORDER)
 		tree_height++;
-	btree->in_memory_depth =
-		(uint32_t)(tree_height * VY_BTREE_MEMORY_FACTOR);
+	double memory_factor = env != NULL ? env->btree_memory_factor : 0.5;
+	btree->in_memory_depth = (uint32_t)(tree_height * memory_factor);
 	btree->root = NULL;
 }
 

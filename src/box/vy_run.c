@@ -38,6 +38,7 @@
 #include "fiber_cond.h"
 #include "fio.h"
 #include "cbus.h"
+#include "cfg.h"
 #include "memory.h"
 #include "coio_task.h"
 #include "mp_util.h"
@@ -201,6 +202,12 @@ vy_run_env_create(struct vy_run_env *env, int read_threads)
 				       cord_slab_cache());
 	vy_page_info_cache_env_create(&env->page_info_cache_env,
 				      cord_slab_cache());
+	env->page_index_cache_env.mem_quota =
+		(size_t)cfg_geti64("vinyl_page_index_cache");
+	env->page_index_cache_env.btree_memory_factor =
+		cfg_getd("vinyl_page_index_btree_memory_factor");
+	env->page_info_cache_env.mem_quota =
+		(size_t)cfg_geti64("vinyl_page_info_cache");
 }
 
 /**

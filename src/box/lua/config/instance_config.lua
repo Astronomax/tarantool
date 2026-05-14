@@ -1041,6 +1041,24 @@ return schema.new('instance_config', schema.record({
             box_cfg_nondynamic = true,
             default = 8 * 1024,
         }),
+        page_index_btree_memory_factor = schema.scalar({
+            type = 'number',
+            box_cfg = 'vinyl_page_index_btree_memory_factor',
+            box_cfg_nondynamic = true,
+            default = 0.5,
+        }),
+        page_index_cache = schema.scalar({
+            type = 'integer',
+            box_cfg = 'vinyl_page_index_cache',
+            box_cfg_nondynamic = true,
+            default = 10000,
+        }),
+        page_info_cache = schema.scalar({
+            type = 'integer',
+            box_cfg = 'vinyl_page_info_cache',
+            box_cfg_nondynamic = true,
+            default = 10000,
+        }),
         range_size = schema.scalar({
             type = 'integer',
             box_cfg = 'vinyl_range_size',

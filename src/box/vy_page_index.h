@@ -116,6 +116,7 @@ struct vy_page_index_cache_env {
 	size_t btree_mem_used;
 	size_t mem_used;
 	size_t mem_quota;
+	double btree_memory_factor;
 	/** Cache stats. */
 	struct {
 		int64_t hit;

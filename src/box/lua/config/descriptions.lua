@@ -2861,6 +2861,19 @@ I['vinyl.page_size'] = format_text([[
     passed to `space_object:create_index()`.
 ]])
 
+I['vinyl.page_index_btree_memory_factor'] = format_text([[
+    Fraction of page-index B-tree levels to keep in memory for each vinyl run.
+    The remaining levels are read from the `.btree` file on demand.
+]])
+
+I['vinyl.page_index_cache'] = format_text([[
+    Memory quota for the vinyl page-index key cache, in bytes.
+]])
+
+I['vinyl.page_info_cache'] = format_text([[
+    Memory quota for the vinyl page-info block cache, in bytes.
+]])
+
 I['vinyl.range_size'] = format_text([[
     The default maximum range size for a vinyl index, in bytes. The maximum
     range size affects the decision of whether to split a range.

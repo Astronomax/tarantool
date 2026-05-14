@@ -118,6 +118,9 @@ local default_cfg = {
     vinyl_range_size          = nil, -- set automatically
     vinyl_page_size           = 8 * 1024,
     vinyl_bloom_fpr           = 0.05,
+    vinyl_page_index_cache    = 10000,
+    vinyl_page_info_cache     = 10000,
+    vinyl_page_index_btree_memory_factor = 0.5,
 
     quiver_dir          = ifdef_quiver('.'),
     quiver_memory       = ifdef_quiver(128 * 1024 * 1024),
@@ -329,6 +332,9 @@ local template_cfg = {
     vinyl_range_size          = 'number',
     vinyl_page_size           = 'number',
     vinyl_bloom_fpr           = 'number',
+    vinyl_page_index_cache    = 'number',
+    vinyl_page_info_cache     = 'number',
+    vinyl_page_index_btree_memory_factor = 'number',
 
     quiver_dir          = ifdef_quiver('string'),
     quiver_memory       = ifdef_quiver('number'),

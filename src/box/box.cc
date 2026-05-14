@@ -1954,8 +1954,14 @@ box_check_vinyl_options(void)
 	int run_count_per_level = cfg_geti("vinyl_run_count_per_level");
 	double run_size_ratio = cfg_getd("vinyl_run_size_ratio");
 	double bloom_fpr = cfg_getd("vinyl_bloom_fpr");
+	double page_index_btree_memory_factor =
+		cfg_getd("vinyl_page_index_btree_memory_factor");
 
 	if (box_check_memory_quota("vinyl_memory") < 0)
+		diag_raise();
+	if (box_check_memory_quota("vinyl_page_index_cache") < 0)
+		diag_raise();
+	if (box_check_memory_quota("vinyl_page_info_cache") < 0)
 		diag_raise();
 
 	if (read_threads < 1) {
@@ -1982,6 +1988,13 @@ box_check_vinyl_options(void)
 	if (bloom_fpr <= 0 || bloom_fpr > 1) {
 		tnt_raise(ClientError, ER_CFG, "vinyl_bloom_fpr",
 			  "must be greater than 0 and less than or equal to 1");
+	}
+	if (page_index_btree_memory_factor < 0 ||
+	    page_index_btree_memory_factor > 1) {
+		tnt_raise(ClientError, ER_CFG,
+			  "vinyl_page_index_btree_memory_factor",
+			  "must be greater than or equal to 0 and "
+			  "less than or equal to 1");
 	}
 }
 
