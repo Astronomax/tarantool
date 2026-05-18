@@ -161,6 +161,16 @@ struct vy_page_index_btree_iterator {
 	struct vy_page_index_btree_path_entry path[VY_PAGE_INDEX_BTREE_MAX_DEPTH];
 };
 
+/** Memory owned by @a page (struct + min_key). */
+static inline size_t
+vy_page_info_memory(const struct vy_page_info *page)
+{
+	size_t size = sizeof(*page);
+	if (page->min_key != NULL)
+		size += mp_len(page->min_key);
+	return size;
+}
+
 /** Memory owned by the in-memory .btree subtree rooted at @a node. */
 static size_t
 vy_page_index_btree_subtree_memory(const struct vy_page_index_btree_node *node)
@@ -1734,7 +1744,10 @@ vy_page_index_cache_env_destroy(struct vy_page_index_cache_env *env)
 static inline size_t
 vy_page_index_cache_node_size(const struct vy_page_index_cache_node *node)
 {
-	return sizeof(*node); /* TODO: + ??? */
+	size_t size = sizeof(*node);
+	if (node->entry.min_key != NULL)
+		size += mp_len(node->entry.min_key);
+	return size;
 }
 
 static struct vy_page_index_cache_node *
@@ -1758,6 +1771,7 @@ static void
 vy_page_index_cache_node_delete(struct vy_page_index_cache_env *env,
 				struct vy_page_index_cache_node *node)
 {
+	assert(env->mem_used >= vy_page_index_cache_node_size(node));
 	env->mem_used -= vy_page_index_cache_node_size(node);
 	rlist_del_entry(node, in_lru);
 	vy_page_index_entry_destroy(&node->entry);
@@ -2061,7 +2075,15 @@ vy_page_info_cache_env_destroy(struct vy_page_info_cache_env *env)
 static inline size_t
 vy_page_info_cache_node_size(const struct vy_page_info_cache_node *node)
 {
-	return sizeof(*node); /* TODO: + ??? */
+	size_t size = sizeof(*node);
+	const struct vy_page_info_block *block = &node->block;
+
+	for (uint32_t i = 0; i < block->r - block->l; i++) {
+		struct vy_page_info *page = block->data[i];
+		if (page != NULL)
+			size += vy_page_info_memory(page);
+	}
+	return size;
 }
 
 static struct vy_page_info_cache_node *
@@ -2085,6 +2107,7 @@ static void
 vy_page_info_cache_node_delete(struct vy_page_info_cache_env *env,
 				struct vy_page_info_cache_node *node)
 {
+	assert(env->mem_used >= vy_page_info_cache_node_size(node));
 	env->mem_used -= vy_page_info_cache_node_size(node);
 	rlist_del_entry(node, in_lru);
 	vy_page_info_block_destroy(&node->block);
