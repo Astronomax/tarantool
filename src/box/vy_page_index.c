@@ -171,9 +171,13 @@ vy_page_info_memory(const struct vy_page_info *page)
 	return size;
 }
 
-/** Memory owned by the in-memory .btree subtree rooted at @a node. */
+/**
+ * Memory of a single node body (struct + keys), without child links
+ * or descendant subtrees. Used to size one on-disk node when measuring
+ * the full tree for btree_memory_factor.
+ */
 static size_t
-vy_page_index_btree_subtree_memory(const struct vy_page_index_btree_node *node)
+vy_page_index_btree_node_footprint(const struct vy_page_index_btree_node *node)
 {
 	size_t s = sizeof(struct vy_page_index_btree_node);
 	if (node->keys != NULL) {
@@ -183,6 +187,14 @@ vy_page_index_btree_subtree_memory(const struct vy_page_index_btree_node *node)
 				s += mp_len(node->keys[i].min_key);
 		}
 	}
+	return s;
+}
+
+/** Memory owned by the in-memory .btree subtree rooted at @a node. */
+static size_t
+vy_page_index_btree_subtree_memory(const struct vy_page_index_btree_node *node)
+{
+	size_t s = vy_page_index_btree_node_footprint(node);
 	if (node->type == VY_PAGE_INDEX_BTREE_NODE_LEAF)
 		return s;
 	if (node->children_in_memory) {
@@ -291,16 +303,10 @@ vy_page_index_btree_create(struct vy_page_index_btree *btree,
 	btree->filepath = strdup(filepath);
 	btree->fd = -1;
 	btree->page_count = page_count;
-	/*
-	 * Estimate the tree height and keep the top fraction
-	 * (VY_BTREE_MEMORY_FACTOR) of levels in memory.
-	 */
-	uint32_t tree_height = 0;
-	for (uint64_t n = page_count; n > 0;
-	     n /= VY_PAGE_INDEX_BTREE_ORDER)
-		tree_height++;
-	double memory_factor = env != NULL ? env->btree_memory_factor : 0.5;
-	btree->in_memory_depth = (uint32_t)(tree_height * memory_factor);
+	btree->btree_memory_factor =
+		env != NULL ? env->btree_memory_factor : 0.5;
+	/* Computed at open from total node memory * btree_memory_factor. */
+	btree->in_memory_depth = 0;
 	btree->root = NULL;
 }
 
@@ -327,6 +333,14 @@ vy_page_index_btree_destroy(struct vy_page_index_btree *btree)
 	TRASH(btree);
 }
 
+static int
+vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
+			      struct vy_page_index_btree_node *node,
+			      uint64_t offset);
+
+static int
+vy_page_index_btree_calc_in_memory_depth(struct vy_page_index_btree *btree);
+
 static struct vy_page_index_btree_node *
 vy_page_index_btree_read_in_memory(struct vy_page_index_btree *btree,
 				   uint64_t node_offset, uint32_t depth);
@@ -344,7 +358,15 @@ vy_page_index_btree_open(struct vy_page_index_btree *btree)
 		btree->fd = fd;
 		assert(btree->data_offset != UINT64_MAX);
 	}
-	if (btree->in_memory_depth == 0 || btree->root != NULL)
+	if (btree->root != NULL)
+		return 0;
+	if (btree->in_memory_depth == 0) {
+		int depth = vy_page_index_btree_calc_in_memory_depth(btree);
+		if (depth < 0)
+			return -1;
+		btree->in_memory_depth = (uint32_t)depth;
+	}
+	if (btree->in_memory_depth == 0)
 		return 0;
 	btree->root = vy_page_index_btree_read_in_memory(
 		btree, btree->root_offset, 0);
@@ -734,6 +756,115 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 fail:
 	ibuf_destroy(&rbuf);
 	vy_page_index_btree_node_destroy(node);
+	return -1;
+}
+
+/** Sum in-memory footprint of all nodes in the subtree at @a offset. */
+static int
+vy_page_index_btree_measure_subtree_memory(struct vy_page_index_btree *btree,
+					   uint64_t offset, size_t *total)
+{
+	struct vy_page_index_btree_node node;
+	if (vy_page_index_btree_node_read(btree, &node, offset) != 0)
+		return -1;
+	*total += vy_page_index_btree_node_footprint(&node);
+	if (node.type == VY_PAGE_INDEX_BTREE_NODE_INTERNAL) {
+		uint32_t child_count = node.key_count + 1;
+		*total += (size_t)child_count * sizeof(*node.children.offsets);
+		for (uint32_t i = 0; i < child_count; i++) {
+			if (vy_page_index_btree_measure_subtree_memory(
+			    btree, node.children.offsets[i], total) != 0) {
+				vy_page_index_btree_node_destroy(&node);
+				return -1;
+			}
+		}
+	}
+	vy_page_index_btree_node_destroy(&node);
+	return 0;
+}
+
+/**
+ * Pick how many upper levels to cache so that their total footprint
+ * is at most btree_memory_factor of the full tree size.
+ */
+static int
+vy_page_index_btree_calc_in_memory_depth(struct vy_page_index_btree *btree)
+{
+	if (btree->btree_memory_factor <= 0.0)
+		return 0;
+
+	size_t total = 0;
+	if (vy_page_index_btree_measure_subtree_memory(
+	    btree, btree->root_offset, &total) != 0)
+		return -1;
+	if (total == 0)
+		return 0;
+
+	double factor = btree->btree_memory_factor;
+	if (factor > 1.0)
+		factor = 1.0;
+	size_t limit = (size_t)((double)total * factor);
+	if (limit == 0)
+		return 0;
+
+	struct region *region = &fiber()->gc;
+	size_t region_svp = region_used(region);
+
+	uint64_t *frontier = (uint64_t *)region_alloc(region, sizeof(uint64_t));
+	if (frontier == NULL) {
+		diag_set(OutOfMemory, sizeof(uint64_t),
+			 "region_alloc", "btree frontier");
+		return -1;
+	}
+	frontier[0] = btree->root_offset;
+	size_t frontier_size = 1;
+	uint32_t depth = 0;
+	size_t accumulated = 0;
+
+	while (frontier_size > 0 &&
+	       depth < VY_PAGE_INDEX_BTREE_MAX_DEPTH) {
+		size_t level_mem = 0;
+		size_t next_cap = frontier_size *
+				  (VY_PAGE_INDEX_BTREE_ORDER + 1);
+		uint64_t *next = (uint64_t *)region_alloc(region,
+			next_cap * sizeof(*next));
+		if (next == NULL) {
+			diag_set(OutOfMemory, next_cap * sizeof(*next),
+				 "region_alloc", "btree frontier");
+			return -1;
+		}
+		size_t next_size = 0;
+
+		for (size_t i = 0; i < frontier_size; i++) {
+			struct vy_page_index_btree_node node;
+			if (vy_page_index_btree_node_read(btree, &node,
+							  frontier[i]) != 0)
+				goto fail;
+			level_mem += vy_page_index_btree_node_footprint(&node);
+			if (node.type == VY_PAGE_INDEX_BTREE_NODE_INTERNAL) {
+				uint32_t child_count = node.key_count + 1;
+				level_mem += (size_t)child_count *
+					       sizeof(*node.children.offsets);
+				for (uint32_t c = 0; c < child_count; c++) {
+					next[next_size++] =
+						node.children.offsets[c];
+				}
+			}
+			vy_page_index_btree_node_destroy(&node);
+		}
+
+		if (accumulated + level_mem > limit && depth > 0)
+			break;
+		accumulated += level_mem;
+		depth++;
+		frontier = next;
+		frontier_size = next_size;
+	}
+
+	region_truncate(region, region_svp);
+	return (int)depth;
+fail:
+	region_truncate(region, region_svp);
 	return -1;
 }
 

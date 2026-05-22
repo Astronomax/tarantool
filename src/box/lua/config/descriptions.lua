@@ -2862,8 +2862,9 @@ I['vinyl.page_size'] = format_text([[
 ]])
 
 I['vinyl.page_index_btree_memory_factor'] = format_text([[
-    Fraction of page-index B-tree levels to keep in memory for each vinyl run.
-    The remaining levels are read from the `.btree` file on demand.
+    Fraction of the estimated in-memory size of all page-index B-tree nodes
+    to keep resident for each vinyl run (upper levels first).
+    The remaining nodes are read from the `.btree` file on demand.
 ]])
 
 I['vinyl.page_index_cache'] = format_text([[

@@ -170,6 +170,11 @@ struct vy_page_index_btree {
 	char *filepath;
 	/** File descriptor for reading, lifetime is bound to run object. */
 	int fd;
+	/**
+	 * Fraction of the estimated in-memory size of all B-tree nodes
+	 * to keep resident (see vy_page_index_btree_open).
+	 */
+	double btree_memory_factor;
 	/** Depth of the in memory part of the tree. */
 	uint32_t in_memory_depth;
 	/** In memory root node. */
