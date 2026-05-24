@@ -117,6 +117,15 @@ struct vy_page_index_cache_env {
 	size_t mem_used;
 	size_t mem_quota;
 	double btree_memory_factor;
+	/** Max keys per B-tree node (fanout). 0 = default at runtime. */
+	uint32_t btree_order;
+	/**
+	 * Read-ahead for on-demand B-tree node reads. Starts at the default;
+	 * after each node read becomes the average on-disk node size seen so far.
+	 */
+	size_t btree_read_ahead;
+	uint64_t btree_read_node_bytes_sum;
+	uint64_t btree_read_node_count;
 	/** Cache stats. */
 	struct {
 		int64_t hit;

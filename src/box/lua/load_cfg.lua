@@ -121,6 +121,7 @@ local default_cfg = {
     vinyl_page_index_cache    = 10000,
     vinyl_page_info_cache     = 10000,
     vinyl_page_index_btree_memory_factor = 0.5,
+    vinyl_page_index_btree_fanout      = 64,
 
     quiver_dir          = ifdef_quiver('.'),
     quiver_memory       = ifdef_quiver(128 * 1024 * 1024),
@@ -335,6 +336,7 @@ local template_cfg = {
     vinyl_page_index_cache    = 'number',
     vinyl_page_info_cache     = 'number',
     vinyl_page_index_btree_memory_factor = 'number',
+    vinyl_page_index_btree_fanout      = 'number',
 
     quiver_dir          = ifdef_quiver('string'),
     quiver_memory       = ifdef_quiver('number'),

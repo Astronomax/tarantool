@@ -90,8 +90,56 @@ vy_page_info_block_read_cb(struct cbus_call_msg *base)
 
 /* {{{ B Tree */
 
-/** B-tree order - maximum number of keys in a node. */
-#define VY_PAGE_INDEX_BTREE_ORDER 64
+enum {
+	/** Default max keys per B-tree node (fanout). */
+	VY_PAGE_INDEX_BTREE_DEFAULT_ORDER = 64,
+	/** Upper bound supported at build time and on disk. */
+	VY_PAGE_INDEX_BTREE_MAX_ORDER = 128,
+	VY_PAGE_INDEX_BTREE_READ_AHEAD_DEFAULT = 4096,
+};
+
+static uint32_t
+vy_page_index_btree_order_value(uint32_t order)
+{
+	if (order == 0)
+		return VY_PAGE_INDEX_BTREE_DEFAULT_ORDER;
+	return order;
+}
+
+static uint32_t
+vy_page_index_btree_order(const struct vy_page_index_btree *btree)
+{
+	if (btree != NULL && btree->env != NULL)
+		return vy_page_index_btree_order_value(btree->env->btree_order);
+	return VY_PAGE_INDEX_BTREE_DEFAULT_ORDER;
+}
+
+static size_t
+vy_page_index_btree_read_ahead(const struct vy_page_index_cache_env *env)
+{
+	if (env == NULL || env->btree_read_ahead == 0)
+		return VY_PAGE_INDEX_BTREE_READ_AHEAD_DEFAULT;
+	return env->btree_read_ahead;
+}
+
+static void
+vy_page_index_btree_note_node_read(struct vy_page_index_cache_env *env,
+				    size_t node_bytes)
+{
+	if (env == NULL || node_bytes == 0)
+		return;
+	if (env->btree_read_node_count >= UINT64_MAX / 4) {
+		env->btree_read_node_bytes_sum >>= 1;
+		env->btree_read_node_count >>= 1;
+		if (env->btree_read_node_count == 0)
+			env->btree_read_node_count = 1;
+	}
+	env->btree_read_node_bytes_sum += node_bytes;
+	env->btree_read_node_count++;
+	size_t avg = (size_t)(env->btree_read_node_bytes_sum /
+			      env->btree_read_node_count);
+	env->btree_read_ahead = MAX(avg, 1);
+}
 #define XLOG_META_TYPE_BTREE "BTREE"
 
 /** B-tree node types. */
@@ -529,17 +577,10 @@ vy_page_index_btree_ibuf_ensure(struct ibuf *buf, struct vy_page_index_btree *bt
 				int fd, const char *filename,
 				uint64_t *read_offset, size_t need)
 {
-	enum {
-		/*
-		 * There is no point in a large read ahead and especially an
-		 * read ahead adaptation mechanism. We don't read the entire
-		 * file from left to right, but rather jump around it.
-		 */
-		VY_PAGE_INDEX_BTREE_READ_AHEAD = 4096,
-	};
 	while (ibuf_used(buf) < need) {
-		size_t to_load = MAX(need - ibuf_used(buf),
-				     VY_PAGE_INDEX_BTREE_READ_AHEAD);
+		size_t read_ahead = vy_page_index_btree_read_ahead(
+			btree != NULL ? btree->env : NULL);
+		size_t to_load = MAX(need - ibuf_used(buf), read_ahead);
 		void *dst = ibuf_reserve(buf, to_load);
 		if (dst == NULL) {
 			diag_set(OutOfMemory, to_load, "ibuf_reserve",
@@ -665,7 +706,8 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 
 	struct ibuf rbuf;
 	ibuf_create(&rbuf, &cord()->slabc, 1024);
-	uint64_t read_offset = btree->data_offset + offset;
+	const uint64_t node_read_start = btree->data_offset + offset;
+	uint64_t read_offset = node_read_start;
 
 	size_t bytes = sizeof(uint8_t) + sizeof(uint32_t);
 
@@ -689,7 +731,7 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 	rbuf.rpos += sizeof(uint32_t);
 
 	if (node->key_count == 0 ||
-	    node->key_count > VY_PAGE_INDEX_BTREE_ORDER) {
+	    node->key_count > VY_PAGE_INDEX_BTREE_MAX_ORDER) {
 		diag_set(ClientError, ER_INVALID_INDEX_FILE, btree->filepath,
 			 "Invalid key count");
 		goto fail;
@@ -732,6 +774,9 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 
 	if (node->type == VY_PAGE_INDEX_BTREE_NODE_LEAF) {
 		ibuf_destroy(&rbuf);
+		vy_page_index_btree_note_node_read(btree->env,
+						   (size_t)(read_offset -
+							    node_read_start));
 		return 0;
 	}
 
@@ -751,6 +796,8 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 	rbuf.rpos += bytes;
 
 	ibuf_destroy(&rbuf);
+	vy_page_index_btree_note_node_read(btree->env,
+					   (size_t)(read_offset - node_read_start));
 	return 0;
 
 fail:
@@ -824,8 +871,8 @@ vy_page_index_btree_calc_in_memory_depth(struct vy_page_index_btree *btree)
 	while (frontier_size > 0 &&
 	       depth < VY_PAGE_INDEX_BTREE_MAX_DEPTH) {
 		size_t level_mem = 0;
-		size_t next_cap = frontier_size *
-				  (VY_PAGE_INDEX_BTREE_ORDER + 1);
+		const uint32_t order = vy_page_index_btree_order(btree);
+		size_t next_cap = frontier_size * ((size_t)order + 1);
 		uint64_t *next = (uint64_t *)region_alloc(region,
 			next_cap * sizeof(*next));
 		if (next == NULL) {
@@ -1591,12 +1638,13 @@ static int
 vy_page_index_btree_build_range(struct vy_page_index_entry *pages,
 				uint32_t lo, uint32_t hi,
 				struct ibuf *wbuf, uint64_t *offset,
-				uint64_t *node_offset)
+				uint64_t *node_offset, uint32_t order)
 {
 	assert(lo <= hi);
 	const uint32_t n = hi - lo;
 
 	assert(n > 0);
+	order = vy_page_index_btree_order_value(order);
 
 	struct region *region = &fiber()->gc;
 	size_t region_svp = region_used(region);
@@ -1605,7 +1653,7 @@ vy_page_index_btree_build_range(struct vy_page_index_entry *pages,
 	memset(&node, 0, sizeof(node));
 
 	/* Leaf. */
-	if (n <= VY_PAGE_INDEX_BTREE_ORDER) {
+	if (n <= order) {
 		node.type = VY_PAGE_INDEX_BTREE_NODE_LEAF;
 		node.key_count = n;
 		size_t bytes = (size_t)n * sizeof(*node.keys);
@@ -1638,7 +1686,7 @@ vy_page_index_btree_build_range(struct vy_page_index_entry *pages,
 	 * 	key_count <= (n - 1) / 2
 	 * Also k is upper bounded by ORDER.
 	 */
-	node.key_count = MIN((n - 1) / 2, VY_PAGE_INDEX_BTREE_ORDER);
+	node.key_count = MIN((n - 1) / 2, order);
 	assert(node.key_count >= 1);
 
 	const uint32_t children_count = node.key_count + 1;
@@ -1657,7 +1705,7 @@ vy_page_index_btree_build_range(struct vy_page_index_entry *pages,
 	 * Write the internal node first with zeroed children offsets,
 	 * then build children and patch offsets.
 	 */
-	uint64_t zero_children[VY_PAGE_INDEX_BTREE_ORDER + 1] = {0};
+	uint64_t zero_children[VY_PAGE_INDEX_BTREE_MAX_ORDER + 1] = {0};
 	node.children.offsets = zero_children;
 
 	const uint32_t base = remaining / children_count;
@@ -1669,8 +1717,8 @@ vy_page_index_btree_build_range(struct vy_page_index_entry *pages,
 	assert(base >= 1);
 
 	/* Precompute child ranges. */
-	uint32_t children_lo[VY_PAGE_INDEX_BTREE_ORDER + 1];
-	uint32_t children_hi[VY_PAGE_INDEX_BTREE_ORDER + 1];
+	uint32_t children_lo[VY_PAGE_INDEX_BTREE_MAX_ORDER + 1];
+	uint32_t children_hi[VY_PAGE_INDEX_BTREE_MAX_ORDER + 1];
 
 	uint32_t pos = lo;
 	for (uint32_t i = 0; i < children_count; i++) {
@@ -1705,11 +1753,11 @@ vy_page_index_btree_build_range(struct vy_page_index_entry *pages,
 	if (rc != 0)
 		return -1;
 
-	uint64_t children[VY_PAGE_INDEX_BTREE_ORDER + 1];
+	uint64_t children[VY_PAGE_INDEX_BTREE_MAX_ORDER + 1];
 	for (uint32_t i = 0; i < children_count; i++) {
 		if (vy_page_index_btree_build_range(
 		    pages, children_lo[i], children_hi[i],
-		    wbuf, offset, &children[i]) != 0) {
+		    wbuf, offset, &children[i], order) != 0) {
 			return -1;
 		}
 	}
@@ -1734,7 +1782,7 @@ vy_page_index_btree_build_range(struct vy_page_index_entry *pages,
  */
 static int
 vy_page_index_btree_build(struct vy_page_index_entry *pages, uint32_t page_count,
-			  const char *filepath)
+			  const char *filepath, uint32_t order)
 {
 	assert(page_count > 0);
 	struct ibuf wbuf;
@@ -1743,7 +1791,8 @@ vy_page_index_btree_build(struct vy_page_index_entry *pages, uint32_t page_count
 	uint64_t root_offset = 0;
 	uint64_t written = 0;
 	if (vy_page_index_btree_build_range(pages, 0, page_count,
-					    &wbuf, &written, &root_offset) != 0)
+					    &wbuf, &written, &root_offset,
+					    order) != 0)
 		goto fail;
 
 	struct xlog xlog;
@@ -1806,7 +1855,8 @@ vy_page_index_btree_write(struct vy_page_index_entry *entries,
 			  uint64_t *data_offset,
 			  struct vy_page_index_cache_env *env)
 {
-	if (vy_page_index_btree_build(entries, page_count, filepath) != 0)
+	uint32_t order = env != NULL ? env->btree_order : 0;
+	if (vy_page_index_btree_build(entries, page_count, filepath, order) != 0)
 		return -1;
 	if (vy_page_index_btree_read_meta(filepath,
 					  root_offset, data_offset) != 0)
@@ -1855,6 +1905,10 @@ vy_page_index_cache_env_create(struct vy_page_index_cache_env *env,
 	env->btree_mem_used = 0;
 	env->mem_used = 0;
 	env->mem_quota = 16 * 1024 * 1024;
+	env->btree_order = 0;
+	env->btree_read_ahead = VY_PAGE_INDEX_BTREE_READ_AHEAD_DEFAULT;
+	env->btree_read_node_bytes_sum = 0;
+	env->btree_read_node_count = 0;
 	memset(&env->stat, 0, sizeof(env->stat));
 	memset(&env->io, 0, sizeof(env->io));
 	mempool_create(&env->cache_node_mempool, slab_cache,

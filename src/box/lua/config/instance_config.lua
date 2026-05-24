@@ -1047,6 +1047,12 @@ return schema.new('instance_config', schema.record({
             box_cfg_nondynamic = true,
             default = 0.5,
         }),
+        page_index_btree_fanout = schema.scalar({
+            type = 'integer',
+            box_cfg = 'vinyl_page_index_btree_fanout',
+            box_cfg_nondynamic = true,
+            default = 64,
+        }),
         page_index_cache = schema.scalar({
             type = 'integer',
             box_cfg = 'vinyl_page_index_cache',

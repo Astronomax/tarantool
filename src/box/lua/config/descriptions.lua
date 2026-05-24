@@ -2867,6 +2867,11 @@ I['vinyl.page_index_btree_memory_factor'] = format_text([[
     The remaining nodes are read from the `.btree` file on demand.
 ]])
 
+I['vinyl.page_index_btree_fanout'] = format_text([[
+    Maximum number of keys per node in the on-disk page-index B-tree.
+    Higher fanout yields a shallower tree and larger nodes.
+]])
+
 I['vinyl.page_index_cache'] = format_text([[
     Memory quota for the vinyl page-index key cache, in bytes.
 ]])

@@ -206,6 +206,8 @@ vy_run_env_create(struct vy_run_env *env, int read_threads)
 		(size_t)cfg_geti64("vinyl_page_index_cache");
 	env->page_index_cache_env.btree_memory_factor =
 		cfg_getd("vinyl_page_index_btree_memory_factor");
+	env->page_index_cache_env.btree_order =
+		(uint32_t)cfg_geti("vinyl_page_index_btree_fanout");
 	env->page_info_cache_env.mem_quota =
 		(size_t)cfg_geti64("vinyl_page_info_cache");
 }
