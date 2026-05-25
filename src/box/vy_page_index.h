@@ -196,12 +196,14 @@ struct vy_page_index_btree {
 
 struct vy_page_info_cache;
 
-#define VY_PAGE_INFO_BLOCK 64
-
 struct vy_page_info_block {
 	uint32_t l;
 	uint32_t r;
-	struct vy_page_info *data[VY_PAGE_INFO_BLOCK];
+	/**
+	 * Array of size (r - l) with page infos for pages [l, r).
+	 * Owned by the block and freed by vy_page_info_block_destroy().
+	 */
+	struct vy_page_info **data;
 };
 
 struct vy_page_info_cache_node {
@@ -262,6 +264,11 @@ vy_page_info_cache_tree_key_cmp(struct vy_page_info_cache_node *a,
 struct vy_page_info_cache_env {
 	/** Back-pointer for coio offload. */
 	struct vy_run_env *run_env;
+	/**
+	 * Page-info array block size in number of pages.
+	 * Controls granularity of I/O and caching for page info blocks.
+	 */
+	uint32_t block_size;
 	struct rlist cache_lru;
 	struct mempool cache_node_mempool;
 	struct matras_allocator allocator;

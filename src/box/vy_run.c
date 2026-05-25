@@ -210,6 +210,8 @@ vy_run_env_create(struct vy_run_env *env, int read_threads)
 		(uint32_t)cfg_geti("vinyl_page_index_btree_fanout");
 	env->page_info_cache_env.mem_quota =
 		(size_t)cfg_geti64("vinyl_page_info_cache");
+	env->page_info_cache_env.block_size =
+		(uint32_t)cfg_geti("vinyl_page_info_block_size");
 }
 
 /**
@@ -3026,12 +3028,13 @@ vy_run_remove_files(const char *dir, uint32_t space_id,
 static NODISCARD struct vy_page_info *
 vy_slice_stream_page_info(struct vy_slice_stream *stream)
 {
+	uint32_t block_size = stream->slice->run->env->page_info_cache_env.block_size;
 	if (!stream->has_page_info_block ||
 	    stream->page_no < stream->page_info_block.l ||
 	    stream->page_no >= stream->page_info_block.r) {
 		if (stream->has_page_info_block)
 			vy_page_info_block_destroy(&stream->page_info_block);
-		uint32_t block_idx = stream->page_no / VY_PAGE_INFO_BLOCK;
+		uint32_t block_idx = stream->page_no / block_size;
 		if (vy_page_index_read_page_info_block(
 		    &stream->slice->run->page_index, block_idx,
 		    &stream->page_info_block) != 0) {

@@ -1958,6 +1958,8 @@ box_check_vinyl_options(void)
 		cfg_getd("vinyl_page_index_btree_memory_factor");
 	int page_index_btree_fanout =
 		cfg_geti("vinyl_page_index_btree_fanout");
+	int page_info_block_size =
+		cfg_geti("vinyl_page_info_block_size");
 
 	if (box_check_memory_quota("vinyl_memory") < 0)
 		diag_raise();
@@ -2004,6 +2006,11 @@ box_check_vinyl_options(void)
 			  "vinyl_page_index_btree_fanout",
 			  "must be greater than or equal to 2 and "
 			  "less than or equal to 128");
+	}
+	if (page_info_block_size < 1 || page_info_block_size > 1024) {
+		tnt_raise(ClientError, ER_CFG,
+			  "vinyl_page_info_block_size",
+			  "must be greater than 0 and less than or equal to 1024");
 	}
 }
 

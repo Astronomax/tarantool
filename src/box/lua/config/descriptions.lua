@@ -2880,6 +2880,12 @@ I['vinyl.page_info_cache'] = format_text([[
     Memory quota for the vinyl page-info block cache, in bytes.
 ]])
 
+I['vinyl.page_info_block_size'] = format_text([[
+    Size of a cached page-info block, in number of pages.
+    Larger values reduce the number of I/O operations for sequential access,
+    but increase overfetch and memory footprint per cache entry.
+]])
+
 I['vinyl.range_size'] = format_text([[
     The default maximum range size for a vinyl index, in bytes. The maximum
     range size affects the decision of whether to split a range.

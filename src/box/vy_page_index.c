@@ -2237,6 +2237,7 @@ vy_page_info_cache_env_create(struct vy_page_info_cache_env *env,
 			       struct slab_cache *slab_cache)
 {
 	rlist_create(&env->cache_lru);
+	env->block_size = 64;
 	env->tree_mem_used = 0;
 	env->mem_used = 0;
 	env->mem_quota = 64 * 1024 * 1024;
@@ -2472,8 +2473,12 @@ void
 vy_page_info_block_destroy(struct vy_page_info_block *block)
 {
 	assert(block->r >= block->l);
-	for (uint32_t i = 0; i < block->r - block->l; i++)
-		vy_page_info_delete(block->data[i]);
+	if (block->data != NULL) {
+		for (uint32_t i = 0; i < block->r - block->l; i++)
+			vy_page_info_delete(block->data[i]);
+		free(block->data);
+		block->data = NULL;
+	}
 	TRASH(block);
 }
 
@@ -2682,9 +2687,10 @@ vy_page_index_array_read_block(struct vy_page_index_array *array,
 			      struct vy_page_info_block *result)
 {
 	assert(array->cmp_def != NULL);
-	uint32_t l = block_idx * VY_PAGE_INFO_BLOCK;
+	uint32_t block_pages = array->cache.env->block_size;
+	uint32_t l = block_idx * block_pages;
 	assert(l < array->page_count);
-	uint32_t r = MIN(array->page_count, l + VY_PAGE_INFO_BLOCK);
+	uint32_t r = MIN(array->page_count, l + block_pages);
 
 	uint64_t *offsets;
 	if (vy_page_index_array_read_block_offsets(array, l, r, &offsets) != 0)
@@ -2693,6 +2699,14 @@ vy_page_index_array_read_block(struct vy_page_index_array *array,
 	memset(result, 0, sizeof(*result));
 	result->l = l;
 	result->r = r;
+	result->data = calloc((size_t)(r - l), sizeof(*result->data));
+	if (result->data == NULL) {
+		diag_set(OutOfMemory,
+			 (size_t)(r - l) * sizeof(*result->data),
+			 "calloc", "page info block");
+		free(offsets);
+		return -1;
+	}
 	assert(array->index_fd >= 0);
 	struct stat st;
 	if (fstat(array->index_fd, &st) != 0) {
@@ -2714,13 +2728,13 @@ vy_page_index_array_read_block(struct vy_page_index_array *array,
 			"Invalid page_info block offset");
 		goto fail_offsets;
 	}
-	size_t block_size = (size_t)(block_end - block_start);
-	char *data = malloc(block_size);
+	size_t block_bytes = (size_t)(block_end - block_start);
+	char *data = malloc(block_bytes);
 	if (data == NULL) {
-		diag_set(OutOfMemory, block_size, "malloc", "page info block");
+		diag_set(OutOfMemory, block_bytes, "malloc", "page info block");
 		goto fail_offsets;
 	}
-	ssize_t readen = fio_pread(array->index_fd, data, block_size,
+	ssize_t readen = fio_pread(array->index_fd, data, block_bytes,
 				  block_start);
 	if (readen < 0) {
 		diag_set(SystemError, "failed to read from file");
@@ -2730,7 +2744,7 @@ vy_page_index_array_read_block(struct vy_page_index_array *array,
 		pm_atomic_fetch_add(&array->cache.env->io.read_bytes, readen);
 		pm_atomic_fetch_add(&array->cache.env->io.read_ops, 1);
 	}
-	if (readen != (ssize_t)block_size) {
+	if (readen != (ssize_t)block_bytes) {
 		vy_page_index_offsets_invalid_diag_set(
 			array->index_offsets_filepath,
 			"Unexpected end of file");
@@ -2887,7 +2901,7 @@ vy_page_index_array_iterator_next(struct vy_page_index_array *array,
 	if (it->page_no < block->r)
 		return 0;
 
-	assert(it->page_no % VY_PAGE_INFO_BLOCK == 0);
+	assert(it->page_no % array->cache.env->block_size == 0);
 
 	struct vy_page_info_cache_tree_iterator cache_it = it->cache_it;
 	vy_page_info_cache_tree_iterator_next(
@@ -2906,7 +2920,7 @@ vy_page_index_array_iterator_next(struct vy_page_index_array *array,
 		}
 	}
 	/* Go to disk. */
-	uint32_t block_idx = it->page_no / VY_PAGE_INFO_BLOCK;
+	uint32_t block_idx = it->page_no / array->cache.env->block_size;
 	if (vy_page_index_array_read_block_to_cache(array, block_idx, &cache_it) != 0)
 		return -1;
 	next_node = vy_page_info_cache_tree_iterator_get_elem(
@@ -2935,7 +2949,7 @@ vy_page_index_array_iterator_prev(struct vy_page_index_array *array,
 	if (block->l <= it->page_no)
 		return 0;
 
-	assert((it->page_no + 1) % VY_PAGE_INFO_BLOCK == 0);
+	assert((it->page_no + 1) % array->cache.env->block_size == 0);
 
 	struct vy_page_info_cache_tree_iterator cache_it = it->cache_it;
 	vy_page_info_cache_tree_iterator_prev(
@@ -2954,7 +2968,7 @@ vy_page_index_array_iterator_prev(struct vy_page_index_array *array,
 		}
 	}
 	/* Go to disk. */
-	uint32_t block_idx = it->page_no / VY_PAGE_INFO_BLOCK;
+	uint32_t block_idx = it->page_no / array->cache.env->block_size;
 	if (vy_page_index_array_read_block_to_cache(array, block_idx, &cache_it) != 0)
 		return -1;
 	prev_node = vy_page_info_cache_tree_iterator_get_elem(
@@ -2991,7 +3005,7 @@ vy_page_index_array_get_page(struct vy_page_index_array *array,
 	}
 	/* Go to disk. */
 	it->page_no = page_no;
-	uint32_t block_idx = page_no / VY_PAGE_INFO_BLOCK;
+	uint32_t block_idx = page_no / array->cache.env->block_size;
 	if (vy_page_index_array_read_block_to_cache(array, block_idx, &cache_it) != 0)
 		return -1;
 	node = vy_page_info_cache_tree_iterator_get_elem(
