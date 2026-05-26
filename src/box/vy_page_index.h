@@ -2,6 +2,7 @@
 #define INCLUDES_TARANTOOL_BOX_VY_PAGE_INDEX_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "key_def.h"
 #include "iterator_type.h"
@@ -203,7 +204,13 @@ struct vy_page_info_block {
 	 * Array of size (r - l) with page infos for pages [l, r).
 	 * Owned by the block and freed by vy_page_info_block_destroy().
 	 */
-	struct vy_page_info **data;
+	struct vy_page_info *data;
+	/**
+	 * Raw data buffer containing the decoded page infos.
+	 * If not NULL, min_key pointers in data point inside this buffer.
+	 */
+	char *raw_data;
+	size_t raw_data_size;
 };
 
 struct vy_page_info_cache_node {

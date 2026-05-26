@@ -3045,7 +3045,7 @@ vy_slice_stream_page_info(struct vy_slice_stream *stream)
 	}
 	assert(stream->page_info_block.l <= stream->page_no &&
 	       stream->page_no < stream->page_info_block.r);
-	return stream->page_info_block.data[
+	return &stream->page_info_block.data[
 		stream->page_no - stream->page_info_block.l];
 }
 

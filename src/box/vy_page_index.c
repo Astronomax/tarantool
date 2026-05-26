@@ -209,16 +209,6 @@ struct vy_page_index_btree_iterator {
 	struct vy_page_index_btree_path_entry path[VY_PAGE_INDEX_BTREE_MAX_DEPTH];
 };
 
-/** Memory owned by @a page (struct + min_key). */
-static inline size_t
-vy_page_info_memory(const struct vy_page_info *page)
-{
-	size_t size = sizeof(*page);
-	if (page->min_key != NULL)
-		size += mp_len(page->min_key);
-	return size;
-}
-
 /**
  * Memory of a single node body (struct + keys), without child links
  * or descendant subtrees. Used to size one on-disk node when measuring
@@ -710,6 +700,7 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 	uint64_t read_offset = node_read_start;
 
 	size_t bytes = sizeof(uint8_t) + sizeof(uint32_t);
+	uint32_t decoded_key_count = 0;
 
 	/* Header: type + key_count */
 	if (vy_page_index_btree_ibuf_ensure(
@@ -738,7 +729,7 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 	}
 
 	bytes = node->key_count * sizeof(*node->keys);
-	node->keys = calloc(node->key_count, sizeof(*node->keys));
+	node->keys = malloc(bytes);
 	if (node->keys == NULL) {
 		diag_set(OutOfMemory, bytes, "malloc", "btree node keys");
 		goto fail;
@@ -769,6 +760,7 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 		    &node->keys[i], rbuf.rpos, entry_size,
 		    btree->cmp_def, btree->filepath) != 0)
 			goto fail;
+		decoded_key_count++;
 		rbuf.rpos += entry_size;
 	}
 
@@ -786,9 +778,9 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 	if (vy_page_index_btree_ibuf_ensure(
 	    &rbuf, btree, btree->fd, btree->filepath, &read_offset, bytes) != 0)
 		goto fail;
-	node->children.offsets = calloc(child_count, sizeof(uint64_t));
+	node->children.offsets = malloc(bytes);
 	if (node->children.offsets == NULL) {
-		diag_set(OutOfMemory, bytes, "calloc", "btree node children");
+		diag_set(OutOfMemory, bytes, "malloc", "btree node children");
 		goto fail;
 	}
 	node->children_in_memory = false;
@@ -802,6 +794,8 @@ vy_page_index_btree_node_read(struct vy_page_index_btree *btree,
 
 fail:
 	ibuf_destroy(&rbuf);
+	if (node->keys != NULL && decoded_key_count < node->key_count)
+		node->key_count = decoded_key_count;
 	vy_page_index_btree_node_destroy(node);
 	return -1;
 }
@@ -928,12 +922,11 @@ static struct vy_page_index_btree_node *
 vy_page_index_btree_read_in_memory(struct vy_page_index_btree *btree,
 				   uint64_t node_offset, uint32_t depth)
 {
-	/* TODO: use malloc instead of calloc. */
 	struct vy_page_index_btree_node *node =
-		calloc(1, sizeof(struct vy_page_index_btree_node));
+		malloc(sizeof(struct vy_page_index_btree_node));
 	if (node == NULL) {
 		diag_set(OutOfMemory, sizeof(struct vy_page_index_btree_node),
-			 "calloc", "btree node");
+			 "malloc", "btree node");
 		return NULL;
 	}
 	if (vy_page_index_btree_node_read(btree, node, node_offset) != 0) {
@@ -972,7 +965,7 @@ vy_page_index_btree_read_in_memory(struct vy_page_index_btree *btree,
 exit:
 	/**
 	 * Offsets were allocated in vy_page_index_btree_node_read
-	 * using calloc.
+	 * using malloc.
 	 */
 	free(offsets);
 	return node;
@@ -2263,12 +2256,9 @@ vy_page_info_cache_node_size(const struct vy_page_info_cache_node *node)
 {
 	size_t size = sizeof(*node);
 	const struct vy_page_info_block *block = &node->block;
-
-	for (uint32_t i = 0; i < block->r - block->l; i++) {
-		struct vy_page_info *page = block->data[i];
-		if (page != NULL)
-			size += vy_page_info_memory(page);
-	}
+	if (block->data != NULL)
+		size += (size_t)(block->r - block->l) * sizeof(*block->data);
+	size += block->raw_data_size;
 	return size;
 }
 
@@ -2474,12 +2464,77 @@ vy_page_info_block_destroy(struct vy_page_info_block *block)
 {
 	assert(block->r >= block->l);
 	if (block->data != NULL) {
-		for (uint32_t i = 0; i < block->r - block->l; i++)
-			vy_page_info_delete(block->data[i]);
+		if (block->raw_data == NULL) {
+			for (uint32_t i = 0; i < block->r - block->l; i++)
+				vy_page_info_destroy(&block->data[i]);
+		}
 		free(block->data);
 		block->data = NULL;
 	}
+	free(block->raw_data);
+	block->raw_data = NULL;
+	block->raw_data_size = 0;
 	TRASH(block);
+}
+
+static int
+vy_page_info_decode_borrowed(struct vy_page_info *page,
+			     const struct xrow_header *xrow,
+			     struct key_def *cmp_def, const char *filename)
+{
+	assert(xrow->type == VY_INDEX_PAGE_INFO);
+	const char *pos = xrow->body->iov_base;
+	memset(page, 0, sizeof(*page));
+	uint64_t key_map = (1 << VY_PAGE_INFO_OFFSET) |
+			   (1 << VY_PAGE_INFO_SIZE) |
+			   (1 << VY_PAGE_INFO_UNPACKED_SIZE) |
+			   (1 << VY_PAGE_INFO_ROW_COUNT) |
+			   (1 << VY_PAGE_INFO_MIN_KEY);
+	uint32_t map_size = mp_decode_map(&pos);
+	uint32_t map_item;
+	const char *key_beg;
+	uint32_t part_count;
+	for (map_item = 0; map_item < map_size; ++map_item) {
+		uint32_t key = mp_decode_uint(&pos);
+		key_map &= ~(1ULL << key);
+		switch (key) {
+		case VY_PAGE_INFO_OFFSET:
+			page->offset = mp_decode_uint(&pos);
+			break;
+		case VY_PAGE_INFO_SIZE:
+			page->size = mp_decode_uint(&pos);
+			break;
+		case VY_PAGE_INFO_ROW_COUNT:
+			page->row_count = mp_decode_uint(&pos);
+			break;
+		case VY_PAGE_INFO_MIN_KEY:
+			key_beg = pos;
+			mp_next(&pos);
+			page->min_key = (char *)key_beg;
+			part_count = mp_decode_array(&key_beg);
+			page->min_key_hint = key_hint(key_beg, part_count,
+						      cmp_def);
+			break;
+		case VY_PAGE_INFO_UNPACKED_SIZE:
+			page->unpacked_size = mp_decode_uint(&pos);
+			break;
+		case VY_PAGE_INFO_ROW_INDEX_OFFSET:
+			page->row_index_offset = mp_decode_uint(&pos);
+			break;
+		default:
+			mp_next(&pos);
+			break;
+		}
+	}
+	if (key_map) {
+		enum vy_page_info_key key = bit_ctz_u64(key_map);
+		diag_set(ClientError, ER_INVALID_INDEX_FILE, filename,
+			 tt_sprintf("Can't decode page info: "
+				    "missing mandatory key %s",
+				    vy_page_info_key_name(key)));
+		return -1;
+	}
+	return 0;
 }
 
 static int
@@ -2653,10 +2708,10 @@ vy_page_index_array_read_block_offsets(struct vy_page_index_array *array,
 	uint32_t count = r - l;
 	if (r < array->page_count)
 		count++;
-	uint64_t *offsets = malloc(count * sizeof(uint64_t));
+	uint64_t *offsets = region_alloc(&fiber()->gc, count * sizeof(uint64_t));
 	if (offsets == NULL) {
 		diag_set(OutOfMemory, count * sizeof(uint64_t),
-			 "malloc", "page info offsets");
+			 "region_alloc", "page info offsets");
 		return -1;
 	}
 	assert(array->index_offsets_fd >= 0);
@@ -2669,7 +2724,6 @@ vy_page_index_array_read_block_offsets(struct vy_page_index_array *array,
 		vy_page_index_offsets_invalid_diag_set(
 			array->index_offsets_filepath,
 			"Failed to read offsets");
-		free(offsets);
 		return -1;
 	}
 	if (array->cache.env != NULL) {
@@ -2692,9 +2746,13 @@ vy_page_index_array_read_block(struct vy_page_index_array *array,
 	assert(l < array->page_count);
 	uint32_t r = MIN(array->page_count, l + block_pages);
 
+	struct region *region = &fiber()->gc;
+	size_t region_svp = region_used(region);
 	uint64_t *offsets;
-	if (vy_page_index_array_read_block_offsets(array, l, r, &offsets) != 0)
+	if (vy_page_index_array_read_block_offsets(array, l, r, &offsets) != 0) {
+		region_truncate(region, region_svp);
 		return -1;
+	}
 
 	memset(result, 0, sizeof(*result));
 	result->l = l;
@@ -2704,15 +2762,14 @@ vy_page_index_array_read_block(struct vy_page_index_array *array,
 		diag_set(OutOfMemory,
 			 (size_t)(r - l) * sizeof(*result->data),
 			 "calloc", "page info block");
-		free(offsets);
+		region_truncate(region, region_svp);
 		return -1;
 	}
 	assert(array->index_fd >= 0);
 	struct stat st;
 	if (fstat(array->index_fd, &st) != 0) {
 		diag_set(SystemError, "fstat failed");
-		free(offsets);
-		return -1;
+		goto fail_offsets;
 	}
 	/*
 	 * Read the whole block range at once. The offsets point to xlog
@@ -2729,12 +2786,13 @@ vy_page_index_array_read_block(struct vy_page_index_array *array,
 		goto fail_offsets;
 	}
 	size_t block_bytes = (size_t)(block_end - block_start);
-	char *data = malloc(block_bytes);
-	if (data == NULL) {
+	result->raw_data = malloc(block_bytes);
+	if (result->raw_data == NULL) {
 		diag_set(OutOfMemory, block_bytes, "malloc", "page info block");
 		goto fail_offsets;
 	}
-	ssize_t readen = fio_pread(array->index_fd, data, block_bytes,
+	result->raw_data_size = block_bytes;
+	ssize_t readen = fio_pread(array->index_fd, result->raw_data, block_bytes,
 				  block_start);
 	if (readen < 0) {
 		diag_set(SystemError, "failed to read from file");
@@ -2764,8 +2822,8 @@ vy_page_index_array_read_block(struct vy_page_index_array *array,
 				"Invalid page_info offset");
 			goto fail;
 		}
-		const char *pos = data + (offset - block_start);
-		const char *end = data + (next_offset - block_start);
+		const char *pos = result->raw_data + (offset - block_start);
+		const char *end = result->raw_data + (next_offset - block_start);
 		struct xrow_header xrow;
 		if (xrow_decode(&xrow, &pos, end, false) != 0 ||
 		    xrow.type != VY_INDEX_PAGE_INFO) {
@@ -2774,23 +2832,16 @@ vy_page_index_array_read_block(struct vy_page_index_array *array,
 				"Can't read page_info row");
 			goto fail;
 		}
-		struct vy_page_info *page = vy_page_info_new();
-		if (page == NULL)
+		struct vy_page_info *page = &result->data[page_no - l];
+		if (vy_page_info_decode_borrowed(page, &xrow, array->cmp_def,
+						 array->index_filepath) != 0)
 			goto fail;
-		if (vy_page_info_decode(page, &xrow, array->cmp_def,
-					array->index_filepath) != 0) {
-			vy_page_info_delete(page);
-			goto fail;
-		}
-		result->data[page_no - l] = page;
 	}
-	free(data);
-	free(offsets);
+	region_truncate(region, region_svp);
 	return 0;
 fail:
-	free(data);
 fail_offsets:
-	free(offsets);
+	region_truncate(region, region_svp);
 	vy_page_info_block_destroy(result);
 	return -1;
 }
@@ -2857,7 +2908,7 @@ vy_page_index_array_iterator_get(struct vy_page_index_array_iterator *it)
 	assert(it->node != NULL);
 	assert(it->node->block.l <= it->page_no &&
 	       it->page_no < it->node->block.r);
-	return it->node->block.data[it->page_no - it->node->block.l];
+	return &it->node->block.data[it->page_no - it->node->block.l];
 }
 
 /* Read a block of page info from the .index file to the cache. */
