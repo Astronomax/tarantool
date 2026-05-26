@@ -2861,10 +2861,14 @@ I['vinyl.page_size'] = format_text([[
     passed to `space_object:create_index()`.
 ]])
 
-I['vinyl.page_index_btree_memory_factor'] = format_text([[
-    Fraction of the estimated in-memory size of all page-index B-tree nodes
-    to keep resident for each vinyl run (upper levels first).
-    The remaining nodes are read from the `.btree` file on demand.
+I['vinyl.page_index_btree_in_memory_depth_max'] = format_text([[
+    Maximum number of upper page-index B-tree levels to keep resident for each
+    vinyl run.
+]])
+
+I['vinyl.page_index_btree_on_disk_depth_min'] = format_text([[
+    Minimum number of lower page-index B-tree levels to keep on disk for each
+    vinyl run.
 ]])
 
 I['vinyl.page_index_btree_fanout'] = format_text([[

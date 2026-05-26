@@ -1041,11 +1041,17 @@ return schema.new('instance_config', schema.record({
             box_cfg_nondynamic = true,
             default = 8 * 1024,
         }),
-        page_index_btree_memory_factor = schema.scalar({
-            type = 'number',
-            box_cfg = 'vinyl_page_index_btree_memory_factor',
+        page_index_btree_in_memory_depth_max = schema.scalar({
+            type = 'integer',
+            box_cfg = 'vinyl_page_index_btree_in_memory_depth_max',
             box_cfg_nondynamic = true,
-            default = 0.5,
+            default = 1,
+        }),
+        page_index_btree_on_disk_depth_min = schema.scalar({
+            type = 'integer',
+            box_cfg = 'vinyl_page_index_btree_on_disk_depth_min',
+            box_cfg_nondynamic = true,
+            default = 1,
         }),
         page_index_btree_fanout = schema.scalar({
             type = 'integer',

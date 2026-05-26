@@ -120,7 +120,8 @@ local default_cfg = {
     vinyl_bloom_fpr           = 0.05,
     vinyl_page_index_cache    = 10000,
     vinyl_page_info_cache     = 10000,
-    vinyl_page_index_btree_memory_factor = 0.5,
+    vinyl_page_index_btree_in_memory_depth_max = 1,
+    vinyl_page_index_btree_on_disk_depth_min = 1,
     vinyl_page_index_btree_fanout      = 64,
     vinyl_page_info_block_size = 64,
 
@@ -336,7 +337,8 @@ local template_cfg = {
     vinyl_bloom_fpr           = 'number',
     vinyl_page_index_cache    = 'number',
     vinyl_page_info_cache     = 'number',
-    vinyl_page_index_btree_memory_factor = 'number',
+    vinyl_page_index_btree_in_memory_depth_max = 'number',
+    vinyl_page_index_btree_on_disk_depth_min = 'number',
     vinyl_page_index_btree_fanout      = 'number',
     vinyl_page_info_block_size = 'number',
 

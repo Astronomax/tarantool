@@ -117,7 +117,10 @@ struct vy_page_index_cache_env {
 	size_t btree_mem_used;
 	size_t mem_used;
 	size_t mem_quota;
-	double btree_memory_factor;
+	/** Max number of upper B-tree levels to keep resident. */
+	uint32_t btree_in_memory_depth_max;
+	/** Min number of lower B-tree levels to keep on disk. */
+	uint32_t btree_on_disk_depth_min;
 	/** Max keys per B-tree node (fanout). 0 = default at runtime. */
 	uint32_t btree_order;
 	/**
@@ -181,10 +184,13 @@ struct vy_page_index_btree {
 	/** File descriptor for reading, lifetime is bound to run object. */
 	int fd;
 	/**
-	 * Fraction of the estimated in-memory size of all B-tree nodes
-	 * to keep resident (see vy_page_index_btree_open).
+	 * Max number of upper B-tree levels to keep resident.
 	 */
-	double btree_memory_factor;
+	uint32_t in_memory_depth_max;
+	/**
+	 * Min number of lower B-tree levels to keep on disk.
+	 */
+	uint32_t on_disk_depth_min;
 	/** Depth of the in memory part of the tree. */
 	uint32_t in_memory_depth;
 	/** In memory root node. */
