@@ -56,6 +56,14 @@ struct vy_page_index_btree_find_task {
 	struct vy_page_index_entry prev;
 };
 
+/** Cbus task for reading a page key by page number on cache miss. */
+struct vy_page_index_btree_get_key_task {
+	struct cbus_call_msg base;
+	struct vy_page_index_btree *btree;
+	uint32_t page_no;
+	struct vy_page_index_entry entry;
+};
+
 static int
 vy_page_index_btree_find_cb(struct cbus_call_msg *base)
 {
@@ -73,6 +81,9 @@ vy_page_index_btree_find_cb(struct cbus_call_msg *base)
 					      &task->next, &task->prev,
 					      &task->equal_key);
 }
+
+static int
+vy_page_index_btree_get_key_cb(struct cbus_call_msg *base);
 
 /** Cbus task for reading a page_info block on cache miss. */
 struct vy_page_info_block_read_task {
@@ -1519,6 +1530,72 @@ fail:
 	return -1;
 }
 
+static uint32_t
+vy_page_index_btree_node_lower_bound_idx(
+	const struct vy_page_index_btree_node *node, int32_t idx)
+{
+	assert(node->key_count > 0);
+	uint32_t lo = 0;
+	uint32_t hi = node->key_count;
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2;
+		if (node->keys[mid].idx < idx)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+static int
+vy_page_index_btree_get_key_by_idx(struct vy_page_index_btree *btree,
+				   uint32_t page_no,
+				   struct vy_page_index_entry *result)
+{
+	assert(btree->fd >= 0);
+	assert(page_no < btree->page_count);
+	int32_t idx = (int32_t)page_no;
+
+	struct vy_page_index_btree_node node;
+	if (vy_page_index_btree_node_get_root(btree, &node) != 0)
+		return -1;
+
+	while (true) {
+		uint32_t pos =
+			vy_page_index_btree_node_lower_bound_idx(&node, idx);
+		if (pos < node.key_count && node.keys[pos].idx == idx) {
+			*result = vy_page_index_entry_copy(&node.keys[pos]);
+			vy_page_index_btree_node_destroy(&node);
+			return 0;
+		}
+		if (node.type == VY_PAGE_INDEX_BTREE_NODE_LEAF)
+			break;
+		struct vy_page_index_btree_node child_node;
+		if (vy_page_index_btree_node_get_child(
+		    btree, &node, pos, &child_node) != 0) {
+			vy_page_index_btree_node_destroy(&node);
+			return -1;
+		}
+		vy_page_index_btree_node_destroy(&node);
+		node = child_node;
+	}
+
+	vy_page_index_btree_node_destroy(&node);
+	diag_set(ClientError, ER_INVALID_INDEX_FILE, btree->filepath,
+		 "Missing page index key");
+	return -1;
+}
+
+static int
+vy_page_index_btree_get_key_cb(struct cbus_call_msg *base)
+{
+	struct vy_page_index_btree_get_key_task *task =
+		(struct vy_page_index_btree_get_key_task *)base;
+	memset(&task->entry, 0, sizeof(task->entry));
+	return vy_page_index_btree_get_key_by_idx(task->btree, task->page_no,
+						  &task->entry);
+}
+
 /* }} B Tree lower/upper_bound */
 
 /* {{ B Tree build */
@@ -2389,6 +2466,7 @@ vy_page_info_decode_borrowed(struct vy_page_info *page,
 			     const struct xrow_header *xrow,
 			     struct key_def *cmp_def, const char *filename)
 {
+	(void)cmp_def;
 	assert(xrow->type == VY_INDEX_PAGE_INFO);
 	const char *pos = xrow->body->iov_base;
 	memset(page, 0, sizeof(*page));
@@ -2396,11 +2474,9 @@ vy_page_info_decode_borrowed(struct vy_page_info *page,
 			   (1 << VY_PAGE_INFO_SIZE) |
 			   (1 << VY_PAGE_INFO_UNPACKED_SIZE) |
 			   (1 << VY_PAGE_INFO_ROW_COUNT) |
-			   (1 << VY_PAGE_INFO_MIN_KEY);
+			   (1 << VY_PAGE_INFO_ROW_INDEX_OFFSET);
 	uint32_t map_size = mp_decode_map(&pos);
 	uint32_t map_item;
-	const char *key_beg;
-	uint32_t part_count;
 	for (map_item = 0; map_item < map_size; ++map_item) {
 		uint32_t key = mp_decode_uint(&pos);
 		key_map &= ~(1ULL << key);
@@ -2413,14 +2489,6 @@ vy_page_info_decode_borrowed(struct vy_page_info *page,
 			break;
 		case VY_PAGE_INFO_ROW_COUNT:
 			page->row_count = mp_decode_uint(&pos);
-			break;
-		case VY_PAGE_INFO_MIN_KEY:
-			key_beg = pos;
-			mp_next(&pos);
-			page->min_key = (char *)key_beg;
-			part_count = mp_decode_array(&key_beg);
-			page->min_key_hint = key_hint(key_beg, part_count,
-						      cmp_def);
 			break;
 		case VY_PAGE_INFO_UNPACKED_SIZE:
 			page->unpacked_size = mp_decode_uint(&pos);
@@ -3028,32 +3096,18 @@ vy_page_index_recover(struct vy_page_index *index,
 		      struct vy_page_index_cache_env *page_index_cache_env,
 		      struct vy_page_info_cache_env *page_info_cache_env,
 		      struct key_def *cmp_def,
-		      struct vy_page_info *page_info_array, uint32_t page_count)
+		      struct vy_page_index_entry *entries, uint32_t page_count)
 {
 	/* Write .btree file if not exists. */
 	uint64_t btree_root_offset = 0;
 	uint64_t btree_data_offset = 0;
 	if (vy_page_index_btree_read_meta(index_btree_path, &btree_root_offset,
 					  &btree_data_offset) != 0) {
-		if (errno != ENOENT || page_count == 0)
+		if (errno != ENOENT || page_count == 0 || entries == NULL)
 			return -1;
 		diag_clear(diag_get());
 		say_warn("missing page index file `%s`, rebuilding",
 			 index_btree_path);
-		struct vy_page_index_entry *entries = region_alloc(
-			&fiber()->gc, (size_t)page_count * sizeof(*entries));
-		if (entries == NULL) {
-			diag_set(OutOfMemory, (size_t)page_count *
-				 sizeof(*entries), "region_alloc",
-				 "page index entries");
-			return -1;
-		}
-		for (uint32_t i = 0; i < page_count; i++) {
-			entries[i].idx = (int32_t)i;
-			entries[i].min_key = page_info_array[i].min_key;
-			entries[i].min_key_hint =
-				page_info_array[i].min_key_hint;
-		}
 		if (vy_page_index_btree_write(entries, page_count,
 					      index_btree_path,
 					      &btree_root_offset,
@@ -3185,6 +3239,25 @@ out:
 	 *  the point where iteration must be started.
 	 */
 	*result = (page > 0 && dir > 0) ? (page - 1) : page;
+	return 0;
+}
+
+int
+vy_page_index_get_key(struct vy_page_index *index, uint32_t page_no,
+		      struct vy_page_index_entry *result)
+{
+	assert(page_no < index->page_count);
+	memset(result, 0, sizeof(*result));
+	if (vy_page_index_btree_open(&index->btree) != 0)
+		return -1;
+	struct vy_page_index_btree_get_key_task task;
+	memset(&task, 0, sizeof(task));
+	task.btree = &index->btree;
+	task.page_no = page_no;
+	if (vy_run_env_coio_call(index->cache.env->run_env, &task.base,
+				 vy_page_index_btree_get_key_cb) != 0)
+		return -1;
+	*result = task.entry;
 	return 0;
 }
 

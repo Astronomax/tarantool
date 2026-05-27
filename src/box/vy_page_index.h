@@ -398,7 +398,7 @@ vy_page_index_recover(struct vy_page_index *index,
 		      struct vy_page_index_cache_env *page_index_cache_env,
 		      struct vy_page_info_cache_env *page_info_cache_env,
 		      struct key_def *cmp_def,
-		      struct vy_page_info *page_info_array, uint32_t page_count);
+		      struct vy_page_index_entry *entries, uint32_t page_count);
 
 int
 vy_page_index_write(struct vy_page_index *index,
@@ -421,6 +421,10 @@ int
 vy_page_index_find_page(struct vy_page_index *index, struct vy_entry key,
 			enum iterator_type itype,
 			uint32_t *result, bool *equal_key);
+
+int
+vy_page_index_get_key(struct vy_page_index *index, uint32_t page_no,
+		      struct vy_page_index_entry *result);
 
 /**
  * Get iterator positioned at page_no.

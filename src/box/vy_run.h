@@ -99,7 +99,10 @@ struct vy_run_info {
 	struct tuple_bloom *bloom;
 	/** Statement statistics. */
 	struct vy_stmt_stat stmt_stat;
-	/** Index file format version (0 = old, 1 = current). */
+	/**
+	 * Index file format version
+	 * (0/1 = legacy min keys in .index, 2 = current).
+	 */
 	uint32_t index_format_version;
 };
 
@@ -117,10 +120,6 @@ struct vy_page_info {
 	uint32_t row_count;
 	/** Offset of the row index in the page. */
 	uint32_t row_index_offset;
-	/** Minimal key stored in the page. */
-	char *min_key;
-	/** Comparison hint of the min key. */
-	hint_t min_key_hint;
 };
 
 /**
@@ -684,6 +683,11 @@ struct vy_run_writer {
 	 * Freed when the writer is destroyed.
 	 */
 	struct vy_page_info *page_info;
+	/**
+	 * Temporary page index entries built during writing.
+	 * Freed when the writer is destroyed.
+	 */
+	struct vy_page_index_entry *page_index_entries;
 	/**
 	 * Current page info capacity. Can grow with page number.
 	 */
