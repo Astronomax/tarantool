@@ -65,6 +65,13 @@ struct vy_page_index_btree_get_key_task {
 };
 
 static int
+vy_page_index_btree_find_chain_stack(struct vy_page_index_btree *btree,
+				     struct vy_entry key, bool lower_bound,
+				     struct vy_page_index_entry *next,
+				     struct vy_page_index_entry *prev,
+				     bool *equal_key);
+
+static int
 vy_page_index_btree_find_cb(struct cbus_call_msg *base)
 {
 	struct vy_page_index_btree_find_task *task =
@@ -76,10 +83,10 @@ vy_page_index_btree_find_cb(struct cbus_call_msg *base)
 	 * The caller must open and preload the shared B-tree before COIO.
 	 * The callback may only read from disk and use immutable B-tree state.
 	 */
-	return vy_page_index_btree_find_chain(task->btree, task->key,
-					      task->lower_bound,
-					      &task->next, &task->prev,
-					      &task->equal_key);
+	return vy_page_index_btree_find_chain_stack(task->btree, task->key,
+						    task->lower_bound,
+						    &task->next, &task->prev,
+						    &task->equal_key);
 }
 
 static int
@@ -1210,7 +1217,7 @@ vy_page_index_btree_iterator_next(struct vy_page_index_btree *btree,
 	return 0;
 }
 
-static int
+static int MAYBE_UNUSED
 vy_page_index_btree_iterator_prev(struct vy_page_index_btree *btree,
 				  struct vy_page_index_btree_iterator *it)
 {
@@ -1323,7 +1330,7 @@ vy_page_index_btree_node_upper_bound(struct vy_page_index_btree *btree,
 	return range[1];
 }
 
-static int
+static int MAYBE_UNUSED
 vy_page_index_btree_lower_bound(struct vy_page_index_btree *btree,
 				struct vy_entry key,
 				struct vy_page_index_btree_iterator *result,
@@ -1392,7 +1399,7 @@ fail:
 	return -1;
 }
 
-static int
+static int MAYBE_UNUSED
 vy_page_index_btree_upper_bound(struct vy_page_index_btree *btree,
 				struct vy_entry key,
 				struct vy_page_index_btree_iterator *result,
@@ -1462,7 +1469,7 @@ fail:
 }
 
 /* Find the last element in the tree. */
-static int
+static int MAYBE_UNUSED
 vy_page_index_btree_last(struct vy_page_index_btree *btree,
 			 struct vy_page_index_btree_iterator *it)
 {
@@ -1473,12 +1480,630 @@ vy_page_index_btree_last(struct vy_page_index_btree *btree,
 	return vy_page_index_btree_iterator_descend_max(btree, it, &root);
 }
 
+struct vy_page_index_btree_path_step {
+	/** Offset of an internal node on the path. */
+	uint64_t node_offset;
+	/** Child index selected on descent. */
+	uint32_t child;
+	/** Pointer to cached in-memory node, if any. */
+	const struct vy_page_index_btree_node *node_mem;
+};
+
+struct vy_page_index_btree_node_view {
+	enum vy_page_index_btree_node_type type;
+	uint32_t key_count;
+	/** Byte offsets inside ibuf (relative to rbuf.buf). */
+	uint32_t *entry_off;
+	/** Decoded idx for each key (parallel to entry_off). */
+	int32_t *entry_idx;
+	/** Byte offsets of entry->min_key inside ibuf (relative to rbuf.buf). */
+	uint32_t *entry_min_key_off;
+	/** Precomputed hints for each key (parallel to entry_off). */
+	hint_t *entry_min_key_hint;
+	/** Children offsets array start (points into ibuf, valid while ibuf lives). */
+	const uint64_t *children;
+	uint64_t node_read_start;
+	uint64_t node_read_end;
+};
+
+static int
+vy_page_index_btree_node_read_view(struct vy_page_index_btree *btree,
+				  struct vy_page_index_btree_node_view *view,
+				  uint64_t offset,
+				  struct ibuf *rbuf,
+				  struct region *region)
+{
+	memset(view, 0, sizeof(*view));
+	if (btree->fd < 0) {
+		diag_set(SystemError, "B-tree file is not opened: %s",
+			 btree->filepath);
+		return -1;
+	}
+
+	rbuf->rpos = rbuf->buf;
+	rbuf->wpos = rbuf->buf;
+	const uint64_t node_read_start = btree->data_offset + offset;
+	uint64_t read_offset = node_read_start;
+
+	/* Header: type + key_count. */
+	size_t bytes = sizeof(uint8_t) + sizeof(uint32_t);
+	if (vy_page_index_btree_ibuf_ensure(
+	    rbuf, btree, btree->fd, btree->filepath, &read_offset, bytes) != 0)
+		return -1;
+
+	const uint8_t type = *(const uint8_t *)rbuf->rpos;
+	rbuf->rpos += sizeof(uint8_t);
+	view->type = (enum vy_page_index_btree_node_type)type;
+
+	if (view->type != VY_PAGE_INDEX_BTREE_NODE_LEAF &&
+	    view->type != VY_PAGE_INDEX_BTREE_NODE_INTERNAL) {
+		diag_set(ClientError, ER_INVALID_INDEX_FILE, btree->filepath,
+			 "Invalid node type");
+		return -1;
+	}
+
+	view->key_count = *(const uint32_t *)rbuf->rpos;
+	rbuf->rpos += sizeof(uint32_t);
+	if (view->key_count == 0 ||
+	    view->key_count > VY_PAGE_INDEX_BTREE_MAX_ORDER) {
+		diag_set(ClientError, ER_INVALID_INDEX_FILE, btree->filepath,
+			 "Invalid key count");
+		return -1;
+	}
+
+	view->entry_off = region_alloc(region, view->key_count *
+				       sizeof(*view->entry_off));
+	view->entry_idx = region_alloc(region, view->key_count *
+				       sizeof(*view->entry_idx));
+	view->entry_min_key_off = region_alloc(region, view->key_count *
+					       sizeof(*view->entry_min_key_off));
+	view->entry_min_key_hint = region_alloc(region, view->key_count *
+						sizeof(*view->entry_min_key_hint));
+	if (view->entry_off == NULL || view->entry_idx == NULL ||
+	    view->entry_min_key_off == NULL || view->entry_min_key_hint == NULL) {
+		diag_set(OutOfMemory, view->key_count, "region_alloc",
+			 "btree node view arrays");
+		return -1;
+	}
+
+	for (uint32_t i = 0; i < view->key_count; i++) {
+		/* Entry size prefix. */
+		if (vy_page_index_btree_ibuf_ensure(
+		    rbuf, btree, btree->fd, btree->filepath, &read_offset,
+		    sizeof(uint32_t)) != 0)
+			return -1;
+		uint32_t entry_size = *(const uint32_t *)rbuf->rpos;
+		rbuf->rpos += sizeof(uint32_t);
+		if (entry_size < sizeof(int32_t) + 1) {
+			diag_set(ClientError, ER_INVALID_INDEX_FILE,
+				 btree->filepath, "Invalid entry size");
+			return -1;
+		}
+		if (vy_page_index_btree_ibuf_ensure(
+		    rbuf, btree, btree->fd, btree->filepath, &read_offset,
+		    entry_size) != 0)
+			return -1;
+
+		const char *entry_pos = rbuf->rpos;
+		view->entry_off[i] = (uint32_t)(entry_pos - rbuf->buf);
+		memcpy(&view->entry_idx[i], entry_pos, sizeof(int32_t));
+		entry_pos += sizeof(int32_t);
+
+		const char *entry_end = rbuf->rpos + entry_size;
+		if (entry_pos >= entry_end || mp_typeof(*entry_pos) != MP_ARRAY) {
+			diag_set(ClientError, ER_INVALID_INDEX_FILE,
+				 btree->filepath, "Invalid entry key");
+			return -1;
+		}
+		const char *key_beg = entry_pos;
+		const char *tmp = entry_pos;
+		mp_next(&tmp);
+		if (tmp > entry_end) {
+			diag_set(ClientError, ER_INVALID_INDEX_FILE,
+				 btree->filepath, "Invalid entry key size");
+			return -1;
+		}
+		view->entry_min_key_off[i] = (uint32_t)(key_beg - rbuf->buf);
+		uint32_t part_count = mp_decode_array(&key_beg);
+		view->entry_min_key_hint[i] =
+			key_hint(key_beg, part_count, btree->cmp_def);
+
+		rbuf->rpos += entry_size;
+	}
+
+	view->children = NULL;
+	if (view->type == VY_PAGE_INDEX_BTREE_NODE_INTERNAL) {
+		size_t child_count = (size_t)view->key_count + 1;
+		bytes = child_count * sizeof(uint64_t);
+		if (vy_page_index_btree_ibuf_ensure(
+		    rbuf, btree, btree->fd, btree->filepath, &read_offset, bytes) != 0)
+			return -1;
+		view->children = (const uint64_t *)rbuf->rpos;
+		rbuf->rpos += bytes;
+	}
+
+	view->node_read_start = node_read_start;
+	view->node_read_end = read_offset;
+	vy_page_index_btree_note_node_read(btree->env,
+					   (size_t)(read_offset - node_read_start));
+	return 0;
+}
+
+static uint32_t
+vy_page_index_btree_view_lower_bound(struct vy_page_index_btree *btree,
+				     struct vy_page_index_btree_node_view *view,
+				     const struct ibuf *rbuf,
+				     struct vy_entry key, bool *eq)
+{
+	*eq = false;
+	uint32_t lo = 0;
+	uint32_t hi = view->key_count;
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2;
+		struct vy_page_index_entry entry;
+		entry.min_key = (char *)(rbuf->buf + view->entry_min_key_off[mid]);
+		entry.min_key_hint = view->entry_min_key_hint[mid];
+		int cmp = vy_page_index_entry_compare_with_key(&entry, key,
+							       btree->cmp_def);
+		if (cmp <= 0) {
+			if (cmp == 0)
+				*eq = true;
+			hi = mid;
+		} else {
+			lo = mid + 1;
+		}
+	}
+	return lo;
+}
+
+static uint32_t
+vy_page_index_btree_view_upper_bound(struct vy_page_index_btree *btree,
+				     struct vy_page_index_btree_node_view *view,
+				     const struct ibuf *rbuf,
+				     struct vy_entry key, bool *eq)
+{
+	*eq = false;
+	uint32_t lo = 0;
+	uint32_t hi = view->key_count;
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2;
+		struct vy_page_index_entry entry;
+		entry.min_key = (char *)(rbuf->buf + view->entry_min_key_off[mid]);
+		entry.min_key_hint = view->entry_min_key_hint[mid];
+		int cmp = vy_page_index_entry_compare_with_key(&entry, key,
+							       btree->cmp_def);
+		if (cmp < 0) {
+			hi = mid;
+		} else {
+			if (cmp == 0)
+				*eq = true;
+			lo = mid + 1;
+		}
+	}
+	return lo;
+}
+
+static int
+vy_page_index_btree_view_get_entry(struct vy_page_index_btree *btree,
+				  const struct vy_page_index_btree_node_view *view,
+				  const struct ibuf *rbuf,
+				  uint32_t pos,
+				  struct vy_page_index_entry *out)
+{
+	assert(pos < view->key_count);
+	memset(out, 0, sizeof(*out));
+	out->idx = view->entry_idx[pos];
+	const char *min_key = rbuf->buf + view->entry_min_key_off[pos];
+	out->min_key = mp_dup(min_key);
+	if (out->min_key == NULL) {
+		diag_set(OutOfMemory, 0, "mp_dup", "page index key");
+		return -1;
+	}
+	out->min_key_hint = view->entry_min_key_hint[pos];
+	(void)btree;
+	return 0;
+}
+
+static int
+vy_page_index_btree_descend_bound(struct vy_page_index_btree *btree,
+				  struct vy_entry key, bool lower_bound,
+				  struct vy_page_index_btree_path_step *path,
+				  uint32_t *depth,
+				  uint64_t *result_offset, uint32_t *result_pos,
+				  const struct vy_page_index_btree_node **result_mem,
+				  bool *equal_key,
+				  struct ibuf *rbuf, struct region *region)
+{
+	*equal_key = false;
+	*depth = 0;
+
+	int32_t found_depth = -1;
+	uint64_t found_offset = 0;
+	uint32_t found_pos = 0;
+	const struct vy_page_index_btree_node *found_mem = NULL;
+
+	uint64_t offset = btree->root_offset;
+	const struct vy_page_index_btree_node *node_mem = btree->root;
+	while (*depth < VY_PAGE_INDEX_BTREE_MAX_DEPTH) {
+		bool eq = false;
+		uint32_t child = 0;
+		uint32_t key_count = 0;
+		enum vy_page_index_btree_node_type type;
+
+		const uint64_t *children_disk = NULL;
+		const struct vy_page_index_btree_node *child_mem = NULL;
+
+		struct vy_page_index_btree_node_view view;
+		size_t region_svp = region_used(region);
+		if (node_mem != NULL) {
+			/*
+			 * Use cached in-memory node. It already has decoded keys
+			 * and (optionally) in-memory children pointers.
+			 */
+			type = node_mem->type;
+			key_count = node_mem->key_count;
+			child = lower_bound ?
+				vy_page_index_btree_node_lower_bound(btree,
+					(struct vy_page_index_btree_node *)node_mem,
+					key, &eq) :
+				vy_page_index_btree_node_upper_bound(btree,
+					(struct vy_page_index_btree_node *)node_mem,
+					key, &eq);
+			if (type == VY_PAGE_INDEX_BTREE_NODE_INTERNAL) {
+				if (node_mem->children_in_memory) {
+					child_mem = node_mem->children.nodes[child];
+				} else {
+					children_disk = node_mem->children.offsets;
+				}
+			}
+		} else {
+			if (vy_page_index_btree_node_read_view(
+			    btree, &view, offset, rbuf, region) != 0) {
+				region_truncate(region, region_svp);
+				return -1;
+			}
+			type = view.type;
+			key_count = view.key_count;
+			child = lower_bound ?
+				vy_page_index_btree_view_lower_bound(btree, &view, rbuf, key, &eq) :
+				vy_page_index_btree_view_upper_bound(btree, &view, rbuf, key, &eq);
+			children_disk = view.children;
+		}
+		*equal_key = *equal_key || eq;
+
+		if (child < key_count) {
+			found_depth = (int32_t)(*depth);
+			found_offset = offset;
+			found_pos = child;
+			found_mem = node_mem;
+		}
+
+		if (type == VY_PAGE_INDEX_BTREE_NODE_LEAF) {
+			/*
+			 * If all keys in the leaf are < (lower_bound) or <= (upper_bound)
+			 * than @a key, we must return the last found candidate in an
+			 * ancestor node, if any.
+			 */
+			if (child < key_count) {
+				*result_offset = offset;
+				*result_pos = child;
+				*result_mem = node_mem;
+			} else if (found_depth != -1) {
+				*result_offset = found_offset;
+				*result_pos = found_pos;
+				*result_mem = found_mem;
+				/*
+				 * Trim the path to the returned node.
+				 * The returned node itself is at found_depth.
+				 */
+				*depth = (uint32_t)found_depth + 1;
+			} else {
+				/* End of tree. */
+				*result_offset = UINT64_MAX;
+				*result_pos = 0;
+				*result_mem = NULL;
+			}
+			region_truncate(region, region_svp);
+			return 0;
+		}
+
+		if (*depth >= VY_PAGE_INDEX_BTREE_MAX_DEPTH) {
+			region_truncate(region, region_svp);
+			vy_page_index_invalid_diag_set(
+				btree->filepath, "B-tree depth limit exceeded");
+			return -1;
+		}
+		path[*depth].node_offset = offset;
+		path[*depth].child = child;
+		path[*depth].node_mem = node_mem;
+		(*depth)++;
+
+		if (child_mem != NULL) {
+			node_mem = child_mem;
+			offset = node_mem->offset;
+		} else {
+			assert(children_disk != NULL);
+			offset = children_disk[child];
+			node_mem = NULL;
+		}
+		region_truncate(region, region_svp);
+	}
+	vy_page_index_invalid_diag_set(btree->filepath, "B-tree depth limit exceeded");
+	return -1;
+}
+
+static void
+vy_page_index_btree_descend_max_from_mem(const struct vy_page_index_btree_node *start,
+					 const struct vy_page_index_btree_node **leaf,
+					 uint32_t *leaf_pos)
+{
+	const struct vy_page_index_btree_node *node = start;
+	while (node->type == VY_PAGE_INDEX_BTREE_NODE_INTERNAL) {
+		assert(node->children_in_memory);
+		node = node->children.nodes[node->key_count];
+	}
+	*leaf = node;
+	*leaf_pos = node->key_count - 1;
+}
+
+static int
+vy_page_index_btree_descend_max_from(struct vy_page_index_btree *btree,
+				     uint64_t start_offset,
+				     uint64_t *leaf_offset, uint32_t *leaf_pos,
+				     struct ibuf *rbuf, struct region *region)
+{
+	uint64_t offset = start_offset;
+	while (true) {
+		struct vy_page_index_btree_node_view view;
+		size_t region_svp = region_used(region);
+		if (vy_page_index_btree_node_read_view(
+		    btree, &view, offset, rbuf, region) != 0) {
+			region_truncate(region, region_svp);
+			return -1;
+		}
+		if (view.type == VY_PAGE_INDEX_BTREE_NODE_LEAF) {
+			*leaf_offset = offset;
+			*leaf_pos = view.key_count - 1;
+			region_truncate(region, region_svp);
+			return 0;
+		}
+		assert(view.children != NULL);
+		offset = view.children[view.key_count]; /* rightmost child */
+		region_truncate(region, region_svp);
+	}
+}
+
+static int MAYBE_UNUSED
+vy_page_index_btree_descend_min_from(struct vy_page_index_btree *btree,
+				     uint64_t start_offset,
+				     uint64_t *leaf_offset, uint32_t *leaf_pos,
+				     struct ibuf *rbuf, struct region *region)
+{
+	uint64_t offset = start_offset;
+	while (true) {
+		struct vy_page_index_btree_node_view view;
+		size_t region_svp = region_used(region);
+		if (vy_page_index_btree_node_read_view(
+		    btree, &view, offset, rbuf, region) != 0) {
+			region_truncate(region, region_svp);
+			return -1;
+		}
+		if (view.type == VY_PAGE_INDEX_BTREE_NODE_LEAF) {
+			*leaf_offset = offset;
+			*leaf_pos = 0;
+			region_truncate(region, region_svp);
+			return 0;
+		}
+		assert(view.children != NULL);
+		offset = view.children[0]; /* leftmost child */
+		region_truncate(region, region_svp);
+	}
+}
+
+static int
+vy_page_index_btree_get_entry_at(struct vy_page_index_btree *btree,
+				 uint64_t node_offset, uint32_t pos,
+				 struct vy_page_index_entry *out,
+				 struct ibuf *rbuf, struct region *region)
+{
+	size_t region_svp = region_used(region);
+	struct vy_page_index_btree_node_view view;
+	if (vy_page_index_btree_node_read_view(
+	    btree, &view, node_offset, rbuf, region) != 0) {
+		region_truncate(region, region_svp);
+		return -1;
+	}
+	if (pos >= view.key_count) {
+		region_truncate(region, region_svp);
+		out->idx = INT32_MAX;
+		out->min_key = NULL;
+		out->min_key_hint = HINT_NONE;
+		return 0;
+	}
+	int rc = vy_page_index_btree_view_get_entry(btree, &view, rbuf, pos, out);
+	region_truncate(region, region_svp);
+	return rc;
+}
+
+static int
+vy_page_index_btree_find_chain_stack(struct vy_page_index_btree *btree,
+				     struct vy_entry key, bool lower_bound,
+				     struct vy_page_index_entry *next,
+				     struct vy_page_index_entry *prev,
+				     bool *equal_key)
+{
+	assert(btree->fd >= 0);
+	assert(btree->in_memory_depth == 0 || btree->root != NULL);
+
+	struct ibuf rbuf;
+	ibuf_create(&rbuf, &cord()->slabc, 1024);
+	struct region *region = &fiber()->gc;
+	size_t region_svp = region_used(region);
+
+	struct vy_page_index_btree_path_step path[VY_PAGE_INDEX_BTREE_MAX_DEPTH];
+	uint32_t depth = 0;
+	uint64_t pos_offset = 0;
+	uint32_t pos_in_node = 0;
+	const struct vy_page_index_btree_node *pos_mem = NULL;
+	if (vy_page_index_btree_descend_bound(
+	    btree, key, lower_bound, path, &depth,
+	    &pos_offset, &pos_in_node, &pos_mem, equal_key, &rbuf, region) != 0)
+		goto fail;
+
+	/* Compute next. */
+	if (pos_offset == UINT64_MAX) {
+		/* End of tree. next is sentinel, prev is the rightmost key. */
+		next->idx = btree->page_count;
+		next->min_key = NULL;
+		next->min_key_hint = HINT_NONE;
+
+		if (btree->root != NULL && btree->root->children_in_memory) {
+			const struct vy_page_index_btree_node *leaf;
+			uint32_t last_pos;
+			vy_page_index_btree_descend_max_from_mem(btree->root, &leaf, &last_pos);
+			*prev = vy_page_index_entry_copy(&leaf->keys[last_pos]);
+		} else {
+			uint64_t last_leaf = 0;
+			uint32_t last_pos = 0;
+			if (vy_page_index_btree_descend_max_from(
+			    btree, btree->root_offset, &last_leaf, &last_pos, &rbuf, region) != 0)
+				goto fail;
+			if (vy_page_index_btree_get_entry_at(
+			    btree, last_leaf, last_pos, prev, &rbuf, region) != 0)
+				goto fail;
+		}
+		goto out;
+	}
+
+	size_t tmp_svp = region_used(region);
+	enum vy_page_index_btree_node_type next_type;
+	const uint64_t *next_children_disk = NULL;
+	const struct vy_page_index_btree_node *next_node_mem = pos_mem;
+	if (next_node_mem != NULL) {
+		assert(pos_in_node < next_node_mem->key_count);
+		*next = vy_page_index_entry_copy(&next_node_mem->keys[pos_in_node]);
+		next_type = next_node_mem->type;
+		if (next_type == VY_PAGE_INDEX_BTREE_NODE_INTERNAL) {
+			if (!next_node_mem->children_in_memory)
+				next_children_disk = next_node_mem->children.offsets;
+		}
+	} else {
+		/* Read next entry from disk (may reside in a leaf or an internal node). */
+		struct vy_page_index_btree_node_view next_view;
+		if (vy_page_index_btree_node_read_view(
+		    btree, &next_view, pos_offset, &rbuf, region) != 0) {
+			region_truncate(region, tmp_svp);
+			goto fail;
+		}
+		if (vy_page_index_btree_view_get_entry(
+		    btree, &next_view, &rbuf, pos_in_node, next) != 0) {
+			region_truncate(region, tmp_svp);
+			goto fail;
+		}
+		next_type = next_view.type;
+		next_children_disk = next_view.children;
+	}
+
+	/* Compute prev. */
+	if (next->idx == 0) {
+		prev->idx = -1;
+		prev->min_key = NULL;
+		prev->min_key_hint = HINT_NONE;
+		region_truncate(region, tmp_svp);
+		goto out;
+	}
+
+	if (next_type == VY_PAGE_INDEX_BTREE_NODE_INTERNAL) {
+		/*
+		 * Predecessor of an internal key is the maximum key of its left child
+		 * subtree (child at index pos_in_node).
+		 */
+		if (next_node_mem != NULL && next_node_mem->children_in_memory) {
+			const struct vy_page_index_btree_node *leaf;
+			uint32_t pred_pos;
+			vy_page_index_btree_descend_max_from_mem(
+				next_node_mem->children.nodes[pos_in_node], &leaf, &pred_pos);
+			*prev = vy_page_index_entry_copy(&leaf->keys[pred_pos]);
+			region_truncate(region, tmp_svp);
+			goto out;
+		}
+
+		assert(next_children_disk != NULL);
+		uint64_t start = next_children_disk[pos_in_node];
+		region_truncate(region, tmp_svp);
+
+		uint64_t pred_leaf = 0;
+		uint32_t pred_pos = 0;
+		if (vy_page_index_btree_descend_max_from(
+		    btree, start, &pred_leaf, &pred_pos, &rbuf, region) != 0)
+			goto fail;
+		if (vy_page_index_btree_get_entry_at(
+		    btree, pred_leaf, pred_pos, prev, &rbuf, region) != 0)
+			goto fail;
+		goto out;
+	}
+
+	/* Leaf case. */
+	if (pos_in_node > 0) {
+		if (next_node_mem != NULL) {
+			*prev = vy_page_index_entry_copy(&next_node_mem->keys[pos_in_node - 1]);
+		} else {
+			struct vy_page_index_btree_node_view next_view;
+			if (vy_page_index_btree_node_read_view(
+			    btree, &next_view, pos_offset, &rbuf, region) != 0) {
+				region_truncate(region, tmp_svp);
+				goto fail;
+			}
+			if (vy_page_index_btree_view_get_entry(
+			    btree, &next_view, &rbuf, pos_in_node - 1, prev) != 0) {
+				region_truncate(region, tmp_svp);
+				goto fail;
+			}
+		}
+		region_truncate(region, tmp_svp);
+		goto out;
+	}
+
+	/* pos_in_node == 0: predecessor is in ancestors (an internal separator key). */
+	region_truncate(region, tmp_svp);
+	int i = (int)depth - 1;
+	for (; i >= 0; i--) {
+		if (path[i].child > 0)
+			break;
+	}
+	if (i < 0) {
+		prev->idx = -1;
+		prev->min_key = NULL;
+		prev->min_key_hint = HINT_NONE;
+		goto out;
+	}
+
+	uint64_t anc_off = path[i].node_offset;
+	uint32_t anc_pos = path[i].child - 1;
+	if (path[i].node_mem != NULL) {
+		*prev = vy_page_index_entry_copy(&path[i].node_mem->keys[anc_pos]);
+	} else {
+		if (vy_page_index_btree_get_entry_at(
+		    btree, anc_off, anc_pos, prev, &rbuf, region) != 0)
+			goto fail;
+	}
+
+out:
+	ibuf_destroy(&rbuf);
+	region_truncate(region, region_svp);
+	return 0;
+fail:
+	ibuf_destroy(&rbuf);
+	region_truncate(region, region_svp);
+	return -1;
+}
+
 /**
  * Find the chain of elements for the given key.
  * A chain is a pair of consecutive elements.
  * The B-tree must be opened by the caller before this function is used.
  */
-static int
+static int MAYBE_UNUSED
 vy_page_index_btree_find_chain(struct vy_page_index_btree *btree,
 			       struct vy_entry key, bool lower_bound,
 			       struct vy_page_index_entry *next,
@@ -2127,8 +2752,10 @@ vy_page_index_cache_add_chain(struct vy_page_index_cache *cache,
 		assert(successor == next_node);
 }
 
+/* Single-entry cache fill is intentionally not supported here. */
+
 /* Find the chain of elements for the given key. */
-static bool
+static bool MAYBE_UNUSED
 vy_page_index_cache_find_chain(struct vy_page_index_cache *cache,
 			       struct vy_entry key, bool lower_bound,
 			       struct vy_page_index_entry *next,
