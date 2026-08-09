@@ -190,6 +190,13 @@ struct memtx_gc_task_vtab {
 	 */
 	void (*run)(struct memtx_gc_task *task, bool *done);
 	/**
+	 * Synchronously finish @task when the engine is being freed, after
+	 * the background gc fiber has been stopped. Called for every task
+	 * remaining in the gc queue before the engine's memory pools and
+	 * arena are destroyed. Yielding is not allowed.
+	 */
+	void (*on_shutdown)(struct memtx_gc_task *task);
+	/**
 	 * Destroy @task.
 	 */
 	void (*free)(struct memtx_gc_task *task);

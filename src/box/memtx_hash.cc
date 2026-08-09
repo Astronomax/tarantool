@@ -230,8 +230,22 @@ memtx_hash_index_gc_free(struct memtx_gc_task *task)
 	memtx_hash_index_free(index);
 }
 
+static void
+memtx_hash_index_gc_on_shutdown(struct memtx_gc_task *task)
+{
+#ifdef ENABLE_ASAN
+	bool done;
+	do {
+		memtx_hash_index_gc_run(task, &done);
+	} while (!done);
+#else
+	(void)task;
+#endif
+}
+
 static const struct memtx_gc_task_vtab memtx_hash_index_gc_vtab = {
 	.run = memtx_hash_index_gc_run,
+	.on_shutdown = memtx_hash_index_gc_on_shutdown,
 	.free = memtx_hash_index_gc_free,
 };
 

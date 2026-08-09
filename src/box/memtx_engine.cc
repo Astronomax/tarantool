@@ -96,6 +96,9 @@ memtx_tuple_new_raw_impl(struct tuple_format *format, const char *data,
 static void
 memtx_engine_run_gc(struct memtx_engine *memtx, bool *stop);
 
+static void
+memtx_engine_complete_gc(struct memtx_engine *memtx);
+
 static void *
 memtx_index_extent_alloc(struct matras_allocator *matras_allocator);
 
@@ -339,12 +342,13 @@ static void
 memtx_engine_free(struct engine *engine)
 {
 	struct memtx_engine *memtx = (struct memtx_engine *)engine;
-#ifdef ENABLE_ASAN
-	/* We check for memory leaks in ASAN. */
-	bool stop = false;
-	while (!stop)
-		memtx_engine_run_gc(memtx, &stop);
-#endif
+	/*
+	 * The background gc fiber has been stopped in memtx_engine_shutdown,
+	 * so finish all tasks still in the gc queue synchronously. Must run
+	 * before the index extent pool and the arena are torn down, since the
+	 * tasks free matras extents and tuples.
+	 */
+	memtx_engine_complete_gc(memtx);
 	mempool_destroy(&memtx->iterator_pool);
 	if (mempool_is_initialized(&memtx->rtree_iterator_pool))
 		mempool_destroy(&memtx->rtree_iterator_pool);
@@ -1862,6 +1866,25 @@ memtx_engine_run_gc(struct memtx_engine *memtx, bool *stop)
 	bool task_done;
 	task->vtab->run(task, &task_done);
 	if (task_done) {
+		stailq_shift(&memtx->gc_queue);
+		task->vtab->free(task);
+	}
+}
+
+/**
+ * Synchronously finish all tasks remaining in the gc queue. Called from
+ * memtx_engine_free after the background gc fiber has been stopped, so the
+ * tasks can no longer be progressed by the fiber and must be completed
+ * inline, before the memory pools and the arena are destroyed.
+ */
+static void
+memtx_engine_complete_gc(struct memtx_engine *memtx)
+{
+	while (!stailq_empty(&memtx->gc_queue)) {
+		struct memtx_gc_task *task = stailq_first_entry(&memtx->gc_queue,
+						struct memtx_gc_task, link);
+		assert(task->vtab->on_shutdown != NULL);
+		task->vtab->on_shutdown(task);
 		stailq_shift(&memtx->gc_queue);
 		task->vtab->free(task);
 	}

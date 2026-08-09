@@ -1021,11 +1021,26 @@ memtx_tree_index_gc_free(struct memtx_gc_task *task)
 }
 
 template <bool USE_HINT>
+static void
+memtx_tree_index_gc_on_shutdown(struct memtx_gc_task *task)
+{
+#ifdef ENABLE_ASAN
+	bool done;
+	do {
+		memtx_tree_index_gc_run<USE_HINT>(task, &done);
+	} while (!done);
+#else
+	(void)task;
+#endif
+}
+
+template <bool USE_HINT>
 static struct memtx_gc_task_vtab * get_memtx_tree_index_gc_vtab()
 {
 	static memtx_gc_task_vtab tab =
 	{
 		.run = memtx_tree_index_gc_run<USE_HINT>,
+		.on_shutdown = memtx_tree_index_gc_on_shutdown<USE_HINT>,
 		.free = memtx_tree_index_gc_free<USE_HINT>,
 	};
 	return &tab;
