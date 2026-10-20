@@ -1513,6 +1513,32 @@ local function upgrade_to_3_3_0()
 end
 
 --------------------------------------------------------------------------------
+-- Tarantool 3.8.0
+--------------------------------------------------------------------------------
+
+local function create_index_local_space()
+    local _space = box.space[box.schema.SPACE_ID]
+    local _index = box.space[box.schema.INDEX_ID]
+    local space_id = box.schema.INDEX_LOCAL_ID
+    local opts = {group_id = 1}
+
+    log.info("create space _index_local")
+    local format = {{name = 'space_id', type = 'unsigned'},
+                    {name = 'index_id', type = 'unsigned'},
+                    {name = 'cursor', type = 'array'}}
+    _space:insert{space_id, ADMIN, '_index_local', 'memtx', 0, opts,
+                  format}
+
+    log.info("create primary index for space _index_local")
+    _index:insert{space_id, 0, 'primary', 'tree', { unique = true },
+                  {{0, 'unsigned'}, {1, 'unsigned'}}}
+end
+
+local function upgrade_to_3_8_0()
+    create_index_local_space()
+end
+
+--------------------------------------------------------------------------------
 
 local handlers = {
     {version = mkversion.new(1, 7, 5), func = upgrade_to_1_7_5},
@@ -1538,6 +1564,7 @@ local handlers = {
     {version = mkversion.new(3, 0, 0), func = upgrade_to_3_0_0},
     {version = mkversion.new(3, 1, 0), func = upgrade_to_3_1_0},
     {version = mkversion.new(3, 3, 0), func = upgrade_to_3_3_0},
+    {version = mkversion.new(3, 8, 0), func = upgrade_to_3_8_0},
 }
 
 builtin.box_init_latest_dd_version_id(
@@ -2117,6 +2144,32 @@ local function downgrade_from_3_3_0(issue_handler)
     drop_gc_consumers(issue_handler)
 end
 
+--------------------------------------------------------------------------------
+-- Tarantool 3.8.0
+--------------------------------------------------------------------------------
+
+local function drop_index_local_space(issue_handler)
+    -- _index_local only stores transient build progress, so it can be
+    -- dropped unconditionally.
+    if issue_handler.dry_run then
+        return
+    end
+
+    local _space = box.space[box.schema.SPACE_ID]
+    local _index = box.space[box.schema.INDEX_ID]
+    local space_id = box.schema.INDEX_LOCAL_ID
+
+    log.info("drop primary index of _index_local")
+    _index:delete{space_id, 0}
+
+    log.info("drop space _index_local")
+    _space:delete{space_id}
+end
+
+local function downgrade_from_3_8_0(issue_handler)
+    drop_index_local_space(issue_handler)
+end
+
 -- Versions should be ordered from newer to older.
 --
 -- Every step can be called in 2 modes. In dry_run mode (issue_handler.dry_run
@@ -2134,6 +2187,7 @@ end
 -- if schema version is 2.10.0.
 --
 local downgrade_handlers = {
+    {version = mkversion.new(3, 8, 0), func = downgrade_from_3_8_0},
     {version = mkversion.new(3, 3, 0), func = downgrade_from_3_3_0},
     {version = mkversion.new(3, 1, 0), func = downgrade_from_3_1_0},
     {version = mkversion.new(3, 0, 0), func = downgrade_from_3_0_0},
@@ -2258,6 +2312,7 @@ local downgrade_versions = {
     "3.6.2",
     "3.6.3",
     "3.7.0",
+    "3.8.0",
     -- DOWNGRADE VERSIONS END
 }
 

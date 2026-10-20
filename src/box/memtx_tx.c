@@ -37,6 +37,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "say.h"
 #include "key_list.h"
 #include "schema_def.h"
 #include "small/mempool.h"
@@ -2576,8 +2577,9 @@ memtx_tx_abort_story_readers(struct memtx_story *story)
 {
 	struct tx_read_tracker *tracker, *tmp;
 	rlist_foreach_entry_safe(tracker, &story->reader_list,
-				 in_reader_list, tmp)
+				 in_reader_list, tmp) {
 		txn_abort_with_conflict(tracker->reader);
+	}
 }
 
 /**
@@ -3448,8 +3450,9 @@ memtx_tx_abort_space_schema_readers(struct space *space, struct txn *ddl_owner)
 		struct tx_read_tracker *tracker, *tmp;
 		rlist_foreach_entry_safe(tracker, &story->reader_list,
 					 in_reader_list, tmp) {
-			if (tracker->reader != ddl_owner)
+			if (tracker->reader != ddl_owner) {
 				txn_abort_with_conflict(tracker->reader);
+			}
 		}
 
 		for (uint32_t i = 0; i < story->index_count; i++) {
@@ -3459,8 +3462,9 @@ memtx_tx_abort_space_schema_readers(struct space *space, struct txn *ddl_owner)
 			rlist_foreach_entry_safe(item,
 						 &story->link[i].read_gaps,
 						 in_read_gaps, tmp) {
-				if (item->txn != ddl_owner)
+				if (item->txn != ddl_owner) {
 					txn_abort_with_conflict(item->txn);
+				}
 			}
 		}
 	}
@@ -3471,8 +3475,9 @@ memtx_tx_abort_space_schema_readers(struct space *space, struct txn *ddl_owner)
 		struct gap_item_base *item, *tmp;
 		rlist_foreach_entry_safe(item, &index->read_gaps,
 					 in_read_gaps, tmp) {
-			if (item->txn != ddl_owner)
+			if (item->txn != ddl_owner) {
 				txn_abort_with_conflict(item->txn);
+			}
 		}
 	}
 
@@ -4105,6 +4110,18 @@ memtx_tx_clear_txn_read_lists(struct txn *txn)
 	assert(rlist_empty(&txn->read_set));
 
 	rlist_del(&txn->in_read_view_txs);
+}
+
+void
+memtx_tx_clear_txn_gap_reads(struct txn *txn)
+{
+	while (!rlist_empty(&txn->gap_list)) {
+		struct gap_item_base *item =
+			rlist_first_entry(&txn->gap_list,
+					  struct gap_item_base,
+					  in_gap_list);
+		memtx_tx_delete_gap(item);
+	}
 }
 
 /**

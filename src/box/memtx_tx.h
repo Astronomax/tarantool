@@ -499,6 +499,13 @@ memtx_tx_save_func_key(struct tuple *tuple, struct index *index,
 		       struct tuple *func_key);
 
 /**
+ * Clear all gap reads (gap_list) accumulated by @a txn during a scan.
+ * Preserves point_holes_list and read_set. Safe to call mid-transaction.
+ */
+void
+memtx_tx_clear_txn_gap_reads(struct txn *txn);
+
+/**
  * Clean memtx_tx part of @a txn.
  *
  * NB: can trigger story garbage collection.

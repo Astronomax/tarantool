@@ -347,7 +347,7 @@ struct txn_stmt {
 	void *engine_savepoint;
 	/** Redo info: the binary log row */
 	struct xrow_header *row;
-	/** on_commit and/or on_rollback list is not empty. */
+	/** on_commit, on_rollback and/or on_prepare list is not empty. */
 	bool has_triggers;
 	/*
 	 * Flag that shows whether this DELETE statement removes a story
@@ -362,6 +362,8 @@ struct txn_stmt {
 	/** Commit/rollback triggers associated with this statement. */
 	struct rlist on_commit;
 	struct rlist on_rollback;
+	/** Prepare triggers associated with this statement. */
+	struct rlist on_prepare;
 };
 
 /**
@@ -832,6 +834,7 @@ txn_stmt_init_triggers(struct txn_stmt *stmt)
 	if (!stmt->has_triggers) {
 		rlist_create(&stmt->on_commit);
 		rlist_create(&stmt->on_rollback);
+		rlist_create(&stmt->on_prepare);
 		stmt->has_triggers = true;
 	}
 }
@@ -850,6 +853,13 @@ txn_stmt_on_rollback(struct txn_stmt *stmt, struct trigger *trigger)
 {
 	txn_stmt_init_triggers(stmt);
 	trigger_add(&stmt->on_rollback, trigger);
+}
+
+static inline void
+txn_stmt_on_prepare(struct txn_stmt *stmt, struct trigger *trigger)
+{
+	txn_stmt_init_triggers(stmt);
+	trigger_add(&stmt->on_prepare, trigger);
 }
 
 /**

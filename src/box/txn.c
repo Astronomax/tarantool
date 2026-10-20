@@ -29,6 +29,7 @@
  * SUCH DAMAGE.
  */
 #include "txn.h"
+#include "say.h"
 #include "memtx_tx.h"
 #include "txn_limbo.h"
 #include "engine.h"
@@ -323,8 +324,10 @@ txn_stmt_destroy(struct txn_stmt *stmt)
 {
 	assert(stmt->add_story == NULL && stmt->del_story == NULL);
 
-	if (stmt->has_triggers)
+	if (stmt->has_triggers) {
 		trigger_destroy(&stmt->on_rollback);
+		trigger_destroy(&stmt->on_prepare);
+	}
 	if (stmt->old_tuple != NULL)
 		tuple_unref(stmt->old_tuple);
 	if (stmt->new_tuple != NULL)
@@ -628,8 +631,10 @@ txn_begin_stmt(struct txn *txn, struct space *space, uint16_t type)
 		return -1;
 	}
 
-	if (txn->status == TXN_IN_READ_VIEW)
+	if (txn->status == TXN_IN_READ_VIEW) {
+		say_info("ABORT_SITE: txn_begin_stmt in_read_view txn=%p", txn);
 		txn_abort_with_conflict(txn);
+	}
 
 	if (txn_check_can_continue(txn) != 0)
 		return -1;
@@ -1073,6 +1078,25 @@ txn_prepare(struct txn *txn)
 	if (txn_check_can_continue(txn) != 0)
 		return -1;
 
+	/*
+	 * Run statement-level on_prepare triggers. They fire after the
+	 * transaction-level before-commit event and before conflict
+	 * resolution (engine_prepare) and PSN assignment. Yielding is
+	 * not allowed: a trigger must not yield, otherwise the engine
+	 * state may get inconsistent.
+	 */
+	struct txn_stmt *stmt;
+	stailq_foreach_entry(stmt, &txn->stmts, next) {
+		if (stmt->has_triggers) {
+			if (trigger_run_reverse(&stmt->on_prepare,
+						stmt) != 0) {
+				txn->status = TXN_ABORTED;
+				return -1;
+			}
+			trigger_destroy(&stmt->on_prepare);
+		}
+	}
+
 	assert(txn->psn == 0);
 	/* psn must be set before calling engine handlers. */
 	txn->psn = txn_next_psn++;
@@ -1302,6 +1326,7 @@ txn_send_to_read_view(struct txn *txn, int64_t psn)
 		 * won't be able to commit once sent to a read view anyway.
 		 */
 		assert(txn->status == TXN_INPROGRESS);
+		say_info("ABORT_SITE: txn_send_to_read_view writer txn=%p psn=%lld", txn, (long long)psn);
 		txn_abort_with_conflict(txn);
 		return;
 	}
@@ -1329,6 +1354,7 @@ txn_abort_with_conflict(struct txn *txn)
 {
 	if (txn->status == TXN_ABORTED)
 		return;
+	say_info("TXN_ABORT_CONFLICT: txn=%p fiber=%s caller=%s:%d", txn, fiber_name(fiber()), "?", 0);
 	assert(txn->status == TXN_INPROGRESS ||
 	       txn->status == TXN_IN_READ_VIEW);
 	assert(txn_has_flag(txn, TXN_SUPPORTS_MVCC));

@@ -133,6 +133,8 @@ static_assert(BOX_INVALID_NAME_MAX <= BOX_NAME_MAX,
 	_(SESSION_SETTINGS, 380, true) \
 	/** Space id of _gc_consumers. */ \
 	_(GC_CONSUMERS, 388, false) \
+	/** Space id of _index_local. Local space. */ \
+	_(INDEX_LOCAL, 396, false) \
 
 /** System space identifier definition. */
 #define SYSTEM_SPACE_MEMBER(name, id, ...) BOX_ ## name ## _ID = id,
@@ -241,6 +243,13 @@ enum {
 	BOX_GC_CONSUMERS_FIELD_UUID = 0,
 	BOX_GC_CONSUMERS_FIELD_VCLOCK = 1,
 	BOX_GC_CONSUMERS_FIELD_OPTS = 2,
+};
+
+/** _index_local fields. */
+enum {
+	BOX_INDEX_LOCAL_FIELD_SPACE_ID = 0,
+	BOX_INDEX_LOCAL_FIELD_INDEX_ID = 1,
+	BOX_INDEX_LOCAL_FIELD_CURSOR = 2,
 };
 
 /** _cluster fields. */

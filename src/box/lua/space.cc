@@ -1018,6 +1018,8 @@ box_lua_space_init(struct lua_State *L)
 	lua_setfield(L, -2, "INDEX_ID");
 	lua_pushnumber(L, BOX_VINDEX_ID);
 	lua_setfield(L, -2, "VINDEX_ID");
+	lua_pushnumber(L, BOX_INDEX_LOCAL_ID);
+	lua_setfield(L, -2, "INDEX_LOCAL_ID");
 	lua_pushnumber(L, BOX_USER_ID);
 	lua_setfield(L, -2, "USER_ID");
 	lua_pushnumber(L, BOX_VUSER_ID);
