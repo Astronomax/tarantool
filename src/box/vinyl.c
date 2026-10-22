@@ -4134,6 +4134,7 @@ static const struct index_build_vtab vinyl_index_build_vtab = {
 	.get_prepared = vinyl_index_build_get_prepared,
 	.replace_concurrent = vinyl_index_build_replace_concurrent,
 	.rollback_concurrent = generic_index_build_rollback_concurrent,
+	.iter_stmt = generic_index_build_iter_stmt,
 };
 
 

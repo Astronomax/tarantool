@@ -1296,6 +1296,7 @@ static const struct index_build_vtab memtx_index_build_vtab = {
 	.get_prepared = memtx_index_build_get_prepared,
 	.replace_concurrent = memtx_index_build_replace_concurrent,
 	.rollback_concurrent = memtx_index_build_rollback_concurrent,
+	.iter_stmt = generic_index_build_iter_stmt,
 };
 
 static int

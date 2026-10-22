@@ -6,9 +6,18 @@
 #include "space.h"
 #include "tuple_format.h"
 
+struct txn_stmt;
+
 #if defined(__cplusplus)
 extern "C" {
 #endif /* defined(__cplusplus) */
+
+/**
+ * Callback type for index_build_vtab::iter_stmt. Called once per
+ * (old_tuple, new_tuple) pair in the statement.
+ */
+typedef int (*index_build_stmt_iter_f)(struct tuple *old_tuple,
+				       struct tuple *new_tuple, void *arg);
 
 /**
  * Engine-specific operations used by the generic index build procedure.
@@ -52,6 +61,15 @@ struct index_build_vtab {
 	 */
 	int (*rollback_concurrent)(struct index *index, struct tuple *old_tuple,
 				   struct tuple *new_tuple);
+	/**
+	 * Iterate over the (old_tuple, new_tuple) pairs produced by @a stmt,
+	 * calling @a cb for each. For regular single-row statements this is one
+	 * call; engine-specific batch statements (e.g. INSERT_ARROW) may yield
+	 * multiple calls. Returns 0 on success; stops and propagates the first
+	 * non-zero return from @a cb.
+	 */
+	int (*iter_stmt)(struct txn_stmt *stmt, index_build_stmt_iter_f cb,
+			 void *arg);
 };
 
 /**
@@ -76,6 +94,10 @@ int
 generic_index_build_rollback_concurrent(struct index *index,
 					struct tuple *old_tuple,
 					struct tuple *new_tuple);
+
+int
+generic_index_build_iter_stmt(struct txn_stmt *stmt,
+			      index_build_stmt_iter_f cb, void *arg);
 
 /**
  * Build @a new_index on top of @a src_space using the generic, engine-agnostic

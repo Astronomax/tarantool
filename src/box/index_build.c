@@ -188,6 +188,13 @@ generic_index_build_rollback_concurrent(struct index *index,
 	return 0;
 }
 
+int
+generic_index_build_iter_stmt(struct txn_stmt *stmt,
+			      index_build_stmt_iter_f cb, void *arg)
+{
+	return cb(stmt->old_tuple, stmt->new_tuple, arg);
+}
+
 static struct index_build_write_point *
 index_build_write_point_new(struct tuple *tuple, hint_t hint, struct txn *txn,
 			    struct index_build_ctx *ctx)
@@ -590,6 +597,39 @@ index_build_stmt_trigger_delete(struct index_build_stmt_trigger *trigger)
  * the statement in the write set and attaches per-statement
  * prepare/commit/rollback triggers.
  */
+struct index_build_on_replace_arg {
+	struct txn *txn;
+	struct index_build_ctx *ctx;
+	bool has_pair;
+	bool txn_aborted;
+};
+
+static int
+index_build_on_replace_f(struct tuple *old_tuple, struct tuple *new_tuple,
+			  void *data)
+{
+	struct index_build_on_replace_arg *a = data;
+	if (a->txn_aborted || (old_tuple == NULL && new_tuple == NULL))
+		return 0;
+	a->has_pair = true;
+	if (new_tuple != NULL &&
+	    tuple_validate(a->ctx->format, new_tuple) != 0)
+		return -1;
+	if (a->ctx->check_unique_constraint && new_tuple != NULL) {
+		if (index_build_check_is_unique_secondary(old_tuple, new_tuple,
+							  a->ctx->index,
+							  a->ctx) != 0)
+			return -1;
+		if (index_build_txn_is_aborted()) {
+			a->txn_aborted = true;
+			return 0;
+		}
+		if (index_build_track(new_tuple, a->txn, a->ctx) != 0)
+			return -1;
+	}
+	return 0;
+}
+
 static int
 index_build_on_replace(struct trigger *trigger, void *event)
 {
@@ -599,30 +639,13 @@ index_build_on_replace(struct trigger *trigger, void *event)
 	struct txn_stmt *stmt = txn_current_stmt(txn);
 	struct index_build_ctx *ctx = trigger->data;
 
-	/*
-	 * Both are NULL when vinyl skips a bad upsert; nothing to
-	 * index in the secondary key.
-	 */
-	if (stmt->old_tuple == NULL && stmt->new_tuple == NULL)
-		return 0;
-
-	if (stmt->new_tuple != NULL &&
-	    tuple_validate(ctx->format,
-				  stmt->new_tuple) != 0)
+	struct index_build_on_replace_arg arg = {
+		.txn = txn, .ctx = ctx, .has_pair = false, .txn_aborted = false,
+	};
+	if (ctx->vtab->iter_stmt(stmt, index_build_on_replace_f, &arg) != 0)
 		return -1;
-
-	if (ctx->check_unique_constraint && stmt->new_tuple != NULL) {
-		if (index_build_check_is_unique_secondary(stmt->old_tuple,
-							  stmt->new_tuple,
-							  ctx->index,
-							  ctx) != 0)
-			return -1;
-		if (index_build_txn_is_aborted())
-			return 0;
-		if (index_build_track(stmt->new_tuple, txn, ctx) != 0)
-			return -1;
-	}
-
+	if (!arg.has_pair || arg.txn_aborted)
+		return 0;
 	index_build_stmt_trigger_add(stmt, ctx);
 	return 0;
 }
@@ -646,6 +669,65 @@ index_build_on_replace(struct trigger *trigger, void *event)
  * (which may abort the build batch and thus the whole build) and drop
  * this transaction's write point.
  */
+struct index_build_on_prepare_arg {
+	struct index_build_ctx *ctx;
+	int csw;
+	bool done;
+	bool any_between;
+};
+
+static int
+index_build_on_prepare_f(struct tuple *old_tuple, struct tuple *new_tuple,
+			  void *data)
+{
+	struct index_build_on_prepare_arg *a = data;
+	if (a->done)
+		return 0;
+	struct index_build_ctx *ctx = a->ctx;
+	struct tuple *mark = new_tuple != NULL ? new_tuple : old_tuple;
+	if (mark == NULL)
+		return 0;
+
+	bool le = ctx->cursor != NULL &&
+		  tuple_compare(mark, HINT_NONE, ctx->cursor, HINT_NONE,
+				ctx->cmp_def) <= 0;
+	bool between = !le && ctx->batch_cursor != NULL &&
+		       tuple_compare(mark, HINT_NONE, ctx->batch_cursor,
+				     HINT_NONE, ctx->cmp_def) <= 0;
+	if (between) {
+		/*
+		 * The current batch has already passed this key. Ask to
+		 * restart it from the saved cursor so that this tuple is
+		 * re-read. MVCC engines also abort the batch transaction
+		 * via read tracking.
+		 */
+		ctx->restart_batch = true;
+		a->any_between = true;
+	}
+	if (le) {
+		/*
+		 * The main loop has already passed this key: apply the
+		 * statement to the building index now.
+		 */
+		int rc = ctx->vtab->replace_concurrent(ctx->index, old_tuple,
+						       new_tuple);
+		VERIFY(fiber()->csw == a->csw);
+		if (rc != 0) {
+			if (!ctx->is_failed) {
+				ctx->is_failed = true;
+				diag_move(diag_get(), &ctx->diag);
+			}
+			a->done = true;
+			return 0;
+		}
+	}
+	index_build_abort_writers(new_tuple, in_txn(), ctx);
+	VERIFY(fiber()->csw == a->csw);
+	index_build_untrack(new_tuple, in_txn(), ctx);
+	VERIFY(fiber()->csw == a->csw);
+	return 0;
+}
+
 static int
 index_build_on_prepare_stmt(struct trigger *base, void *event)
 {
@@ -661,49 +743,11 @@ index_build_on_prepare_stmt(struct trigger *base, void *event)
 
 	trigger->has_run_on_prepare = true;
 
-	struct tuple *mark = stmt->new_tuple != NULL ? stmt->new_tuple :
-						       stmt->old_tuple;
-
-	bool le = ctx->cursor != NULL && tuple_compare(mark, HINT_NONE,
-						       ctx->cursor, HINT_NONE,
-						       ctx->cmp_def) <= 0;
-	bool between = !le && ctx->batch_cursor != NULL &&
-		       tuple_compare(mark, HINT_NONE,
-				     ctx->batch_cursor, HINT_NONE,
-				     ctx->cmp_def) <= 0;
-
-	if (between) {
-		/*
-		 * The current batch has already passed this key. Ask to
-		 * restart it from the saved cursor so that this tuple is
-		 * re-read. MVCC engines also abort the batch transaction
-		 * via read tracking.
-		 */
-		ctx->restart_batch = true;
-	}
-
-	struct tuple *old_tuple = NULL;
-	if (le) {
-		/*
-		 * The main loop has already passed this key: apply the
-		 * statement to the building index now.
-		 */
-		old_tuple = stmt->old_tuple;
-		int rc = ctx->vtab->replace_concurrent(ctx->index, old_tuple,
-						       stmt->new_tuple);
-		VERIFY(fiber()->csw == csw);
-		if (rc != 0) {
-			if (!ctx->is_failed) {
-				ctx->is_failed = true;
-				diag_move(diag_get(), &ctx->diag);
-			}
-			goto out;
-		}
-	}
-
-	index_build_abort_writers(stmt->new_tuple, in_txn(), ctx);
-	index_build_untrack(stmt->new_tuple, in_txn(), ctx);
-	assert(!index_build_txn_is_aborted() || between);
+	struct index_build_on_prepare_arg arg = {
+		.ctx = ctx, .csw = csw, .done = false, .any_between = false,
+	};
+	ctx->vtab->iter_stmt(stmt, index_build_on_prepare_f, &arg);
+	assert(!index_build_txn_is_aborted() || arg.any_between);
 out:
 	VERIFY(fiber()->csw == csw);
 	return 0;
@@ -727,6 +771,41 @@ index_build_on_commit_stmt(struct trigger *base, void *event)
  * time (if any) and abort transactions that conflict with the restored
  * tuple.
  */
+struct index_build_on_rollback_arg {
+	struct index_build_ctx *ctx;
+	int csw;
+	bool has_run_on_prepare;
+};
+
+static int
+index_build_on_rollback_f(struct tuple *old_tuple, struct tuple *new_tuple,
+			   void *data)
+{
+	struct index_build_on_rollback_arg *a = data;
+	if (a->ctx->is_failed)
+		return 0;
+	if (!a->has_run_on_prepare) {
+		index_build_untrack(new_tuple, in_txn(), a->ctx);
+		return 0;
+	}
+	if (old_tuple != NULL &&
+	    tuple_validate(a->ctx->format, old_tuple) != 0) {
+		a->ctx->is_failed = true;
+		diag_move(diag_get(), &a->ctx->diag);
+		return 0;
+	}
+	index_build_abort_writers(old_tuple, in_txn(), a->ctx);
+	VERIFY(fiber()->csw == a->csw);
+	int rc = a->ctx->vtab->rollback_concurrent(a->ctx->index, old_tuple,
+						   new_tuple);
+	VERIFY(fiber()->csw == a->csw);
+	if (rc != 0) {
+		a->ctx->is_failed = true;
+		diag_move(diag_get(), &a->ctx->diag);
+	}
+	return 0;
+}
+
 static int
 index_build_on_rollback_stmt(struct trigger *base, void *event)
 {
@@ -743,28 +822,11 @@ index_build_on_rollback_stmt(struct trigger *base, void *event)
 	if (ctx->is_failed)
 		goto out;
 
-	if (!trigger->has_run_on_prepare) {
-		index_build_untrack(stmt->new_tuple, in_txn(), ctx);
-		goto out;
-	}
-
-	if (stmt->old_tuple != NULL &&
-	    tuple_validate(ctx->format,
-				  stmt->old_tuple) != 0) {
-		ctx->is_failed = true;
-		diag_move(diag_get(), &ctx->diag);
-		goto out;
-	}
-
-	index_build_abort_writers(stmt->old_tuple, in_txn(), ctx);
-
-	int rc = ctx->vtab->rollback_concurrent(ctx->index, stmt->old_tuple,
-						stmt->new_tuple);
-	if (rc != 0) {
-		ctx->is_failed = true;
-		diag_move(diag_get(), &ctx->diag);
-	}
-
+	struct index_build_on_rollback_arg arg = {
+		.ctx = ctx, .csw = csw,
+		.has_run_on_prepare = trigger->has_run_on_prepare,
+	};
+	ctx->vtab->iter_stmt(stmt, index_build_on_rollback_f, &arg);
 out:
 	VERIFY(fiber()->csw == csw);
 	return 0;
