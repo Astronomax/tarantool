@@ -83,6 +83,8 @@ struct xlog_opts {
 	 * to be read frequently, e.g. L1 run files in Vinyl.
 	 */
 	bool no_compression;
+	/** Allow xlog_materialize() to replace the final file atomically. */
+	bool replace_existing;
 };
 
 extern const struct xlog_opts xlog_opts_default;
@@ -484,9 +486,8 @@ xdir_create_materialized_xlog(struct xdir *dir, struct xlog *xlog,
 			      const struct vclock *vclock);
 
 /**
- * Create new xlog writer based on fd.
- * @param fd            file descriptor
- * @param name          the assiciated name
+ * Create a new .inprogress file and initialize its xlog writer.
+ * @param name          final file name
  * @param flags		flags to open the file or 0 for defaults
  * @param meta          xlog meta
  * @param opts          write options
@@ -791,6 +792,28 @@ xlog_cursor_openfd(struct xlog_cursor *cursor, int fd, const char *name);
  */
 int
 xlog_cursor_open(struct xlog_cursor *cursor, const char *name);
+
+/** Open only the metadata header, for callers that will seek before reading. */
+int
+xlog_cursor_open_header(struct xlog_cursor *cursor, const char *name);
+
+/** Position the next xlog_cursor_next_tx() at a known transaction extent. */
+void
+xlog_cursor_seek_tx(struct xlog_cursor *cursor, off_t offset, size_t size);
+
+/** Sequential access to a large plain transaction with incremental CRC. */
+struct xlog_tx_stream {
+	struct xlog_cursor *cursor;
+	uint32_t remaining;
+	uint32_t crc, expected_crc;
+};
+
+int
+xlog_tx_stream_open(struct xlog_tx_stream *stream, struct xlog_cursor *cursor);
+
+/** The returned bytes are valid until the next read. The last read checks CRC. */
+const char *
+xlog_tx_stream_read(struct xlog_tx_stream *stream, uint32_t size);
 
 /**
  * Open cursor from memory

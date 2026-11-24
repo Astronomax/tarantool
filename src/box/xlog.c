@@ -99,6 +99,7 @@ const struct xlog_opts xlog_opts_default = {
 	.free_cache = false,
 	.sync_is_async = false,
 	.no_compression = false,
+	.replace_existing = false,
 };
 
 /* {{{ struct xlog_meta */
@@ -835,10 +836,10 @@ xlog_create(struct xlog *xlog, const char *name, int flags,
 	int meta_len;
 
 	/*
-	 * Check whether a file with this name already exists.
-	 * We don't overwrite existing files.
+	 * An explicit replacement writes a new .inprogress file and swaps
+	 * it into place on materialize.
 	 */
-	if (access(name, F_OK) == 0) {
+	if (!opts->replace_existing && access(name, F_OK) == 0) {
 		errno = EEXIST;
 		diag_set(SystemError, "file '%s' already exists", name);
 		goto err;
@@ -1971,14 +1972,15 @@ xlog_cursor_next(struct xlog_cursor *cursor,
 	return 0;
 }
 
-int
-xlog_cursor_openfd(struct xlog_cursor *i, int fd, const char *name)
+static int
+xlog_cursor_openfd_impl(struct xlog_cursor *i, int fd, const char *name,
+			bool read_ahead)
 {
 	memset(i, 0, sizeof(*i));
 	i->fd = fd;
-	i->read_ahead = XLOG_READ_AHEAD_MIN;
+	i->read_ahead = read_ahead ? XLOG_READ_AHEAD_MIN : 0;
 	ibuf_create(&i->rbuf, &cord()->slabc,
-		    XLOG_TX_AUTOCOMMIT_THRESHOLD << 1);
+		    read_ahead ? XLOG_TX_AUTOCOMMIT_THRESHOLD << 1 : XLOG_META_LEN_MAX);
 
 	ssize_t rc;
 	/*
@@ -2004,6 +2006,8 @@ xlog_cursor_openfd(struct xlog_cursor *i, int fd, const char *name)
 			 "failed to create context");
 		goto error;
 	}
+	if (!read_ahead)
+		i->read_ahead = XLOG_READ_AHEAD_MIN;
 	i->state = XLOG_CURSOR_ACTIVE;
 	i->search_magic = false;
 	i->error = NULL;
@@ -2014,19 +2018,96 @@ error:
 }
 
 int
-xlog_cursor_open(struct xlog_cursor *i, const char *name)
+xlog_cursor_openfd(struct xlog_cursor *i, int fd, const char *name)
 {
-	int fd = open(name, O_RDONLY);
+	return xlog_cursor_openfd_impl(i, fd, name, true);
+}
+
+static int
+xlog_cursor_open_impl(struct xlog_cursor *i, const char *name, bool read_ahead)
+{
+	int fd = open(name, O_RDONLY | (read_ahead ? 0 : O_CLOEXEC));
 	if (fd < 0) {
 		diag_set(SystemError, "failed to open '%s' file", name);
 		return -1;
 	}
-	int rc = xlog_cursor_openfd(i, fd, name);
+	int rc = xlog_cursor_openfd_impl(i, fd, name, read_ahead);
 	if (rc < 0) {
 		close(fd);
 		return -1;
 	}
 	return 0;
+}
+
+int
+xlog_cursor_open(struct xlog_cursor *i, const char *name)
+{
+	return xlog_cursor_open_impl(i, name, true);
+}
+
+int
+xlog_cursor_open_header(struct xlog_cursor *i, const char *name)
+{
+	return xlog_cursor_open_impl(i, name, false);
+}
+
+void
+xlog_cursor_seek_tx(struct xlog_cursor *cursor, off_t offset, size_t size)
+{
+	assert(cursor->state == XLOG_CURSOR_ACTIVE || cursor->state == XLOG_CURSOR_TX);
+	off_t pos = xlog_cursor_pos(cursor);
+	if (offset >= pos && offset <= cursor->read_offset) {
+		cursor->rbuf.rpos += offset - pos;
+	} else {
+		ibuf_reset(&cursor->rbuf);
+		cursor->read_offset = offset;
+	}
+	cursor->read_ahead = MIN(size, (size_t)XLOG_READ_AHEAD_MIN);
+}
+
+int
+xlog_tx_stream_open(struct xlog_tx_stream *stream, struct xlog_cursor *cursor)
+{
+	assert(cursor->state == XLOG_CURSOR_ACTIVE);
+	int rc = xlog_cursor_ensure(cursor, XLOG_FIXHEADER_SIZE);
+	if (rc < 0)
+		return -1;
+	const char *p = cursor->rbuf.rpos;
+	struct xlog_fixheader header;
+	if (rc > 0 || xlog_fixheader_decode(&header, &p, cursor->rbuf.wpos) != 0 ||
+	    header.magic != row_marker) {
+		diag_set(XlogError, "expected a plain transaction in %s", cursor->name);
+		return -1;
+	}
+	cursor->rbuf.rpos += XLOG_FIXHEADER_SIZE;
+	stream->cursor = cursor;
+	stream->remaining = header.len;
+	stream->expected_crc = header.crc32c;
+	stream->crc = 0;
+	return 0;
+}
+
+const char *
+xlog_tx_stream_read(struct xlog_tx_stream *stream, uint32_t size)
+{
+	struct xlog_cursor *cursor = stream->cursor;
+	/* A streamed transaction may be much larger than the working set. */
+	cursor->read_ahead = MIN(cursor->read_ahead, (size_t)XLOG_READ_AHEAD_MIN);
+	int rc = size <= stream->remaining ? xlog_cursor_ensure(cursor, size) : 1;
+	if (rc != 0) {
+		if (rc > 0)
+			diag_set(XlogError, "short transaction in %s", cursor->name);
+		return NULL;
+	}
+	const char *p = cursor->rbuf.rpos;
+	cursor->rbuf.rpos += size;
+	stream->remaining -= size;
+	stream->crc = crc32_calc(stream->crc, p, size);
+	if (stream->remaining == 0 && stream->crc != stream->expected_crc) {
+		diag_set(XlogError, "tx checksum mismatch in %s", cursor->name);
+		return NULL;
+	}
+	return p;
 }
 
 int
