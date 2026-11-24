@@ -2861,6 +2861,37 @@ I['vinyl.page_size'] = format_text([[
     passed to `space_object:create_index()`.
 ]])
 
+I['vinyl.page_index_btree_in_memory_depth_max'] = format_text([[
+    Maximum number of upper page-index B-tree levels to keep resident for each
+    vinyl run. These nodes and the run's sample of page keys are accounted
+    separately from the two page-index cache quotas.
+]])
+
+I['vinyl.page_index_btree_on_disk_depth_min'] = format_text([[
+    Minimum number of lower page-index B-tree levels to fetch on demand for
+    each vinyl run. Takes precedence over the maximum resident depth.
+]])
+
+I['vinyl.page_index_btree_fanout'] = format_text([[
+    Maximum number of children per internal page-index node in new vinyl runs.
+    Higher fanout yields a shallower tree and larger nodes.
+]])
+
+I['vinyl.page_index_cache'] = format_text([[
+    Memory quota in bytes for cached internal page-index nodes across all
+    vinyl runs. Zero disables this cache.
+]])
+
+I['vinyl.page_info_cache'] = format_text([[
+    Memory quota in bytes for cached page-index leaves across all vinyl runs.
+    Leaves contain page keys and page metadata. Zero disables this cache.
+]])
+
+I['vinyl.page_info_block_size'] = format_text([[
+    Maximum number of data pages indexed by one leaf in new vinyl runs.
+    Larger leaves cover longer scans per read and use more cache space per leaf.
+]])
+
 I['vinyl.range_size'] = format_text([[
     The default maximum range size for a vinyl index, in bytes. The maximum
     range size affects the decision of whether to split a range.

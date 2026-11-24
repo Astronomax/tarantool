@@ -76,6 +76,13 @@ vy_lsm_env_create(struct vy_lsm_env *env, const char *path,
 		  vy_upsert_thresh_cb upsert_thresh_cb,
 		  void *upsert_thresh_arg)
 {
+	env->bloom_size = 0;
+	env->page_index_disk_size = 0;
+	env->disk_data_size = 0;
+	env->disk_index_size = 0;
+	env->compacted_data_size = 0;
+	env->compaction_queue_size = 0;
+
 	env->empty_key.hint = HINT_NONE;
 	env->empty_key.stmt = vy_key_new(key_format, NULL, 0);
 	if (env->empty_key.stmt == NULL)
@@ -356,7 +363,7 @@ vy_lsm_recover_run(struct vy_lsm *lsm, struct vy_run_recovery_info *run_info,
 	run->dump_lsn = run_info->dump_lsn;
 	run->dump_count = run_info->dump_count;
 	if (vy_run_recover(run, lsm->env->path, lsm->space_id, lsm->index_id,
-			   lsm->cmp_def) != 0 &&
+			   lsm->cmp_def, force_recovery) != 0 &&
 	    (!force_recovery ||
 	     vy_run_rebuild_index(run, lsm->env->path,
 				  lsm->space_id, lsm->index_id,
@@ -417,7 +424,7 @@ vy_lsm_recover_slice(struct vy_lsm *lsm, struct vy_range *range,
 	if (run == NULL)
 		goto out;
 
-	slice = vy_slice_new(slice_info->id, run, begin, end, lsm->cmp_def);
+	slice = vy_slice_new(slice_info->id, run, lsm->cmp_def, begin, end);
 	if (slice == NULL)
 		goto out;
 
@@ -732,6 +739,7 @@ vy_lsm_add_run(struct vy_lsm *lsm, struct vy_run *run)
 	struct vy_lsm_env *env = lsm->env;
 	size_t bloom_size = vy_run_bloom_size(run);
 	size_t page_index_size = run->page_index_size;
+	size_t page_index_disk_size = run->page_index_disk_size;
 
 	assert(rlist_empty(&run->in_lsm));
 	rlist_add_entry(&lsm->runs, run, in_lsm);
@@ -743,7 +751,7 @@ vy_lsm_add_run(struct vy_lsm *lsm, struct vy_run *run)
 	lsm->page_index_size += page_index_size;
 
 	env->bloom_size += bloom_size;
-	env->page_index_size += page_index_size;
+	env->page_index_disk_size += (int64_t)page_index_disk_size;
 
 	/* Data size is consistent with space.bsize. */
 	if (lsm->index_id == 0)
@@ -760,6 +768,7 @@ vy_lsm_remove_run(struct vy_lsm *lsm, struct vy_run *run)
 	struct vy_lsm_env *env = lsm->env;
 	size_t bloom_size = vy_run_bloom_size(run);
 	size_t page_index_size = run->page_index_size;
+	size_t page_index_disk_size = run->page_index_disk_size;
 
 	assert(lsm->run_count > 0);
 	assert(!rlist_empty(&run->in_lsm));
@@ -772,7 +781,7 @@ vy_lsm_remove_run(struct vy_lsm *lsm, struct vy_run *run)
 	lsm->page_index_size -= page_index_size;
 
 	env->bloom_size -= bloom_size;
-	env->page_index_size -= page_index_size;
+	env->page_index_disk_size -= (int64_t)page_index_disk_size;
 
 	/* Data size is consistent with space.bsize. */
 	if (lsm->index_id == 0)
@@ -1089,15 +1098,17 @@ vy_lsm_find_range_intersection(struct vy_lsm *lsm,
 	return 0;
 }
 
-bool
-vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range)
+int
+vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range,
+		   bool *was_split)
 {
+	*was_split = false;
+
 	struct tuple_format *key_format = lsm->env->key_format;
 
 	const char *split_key_raw;
-	if (!vy_range_needs_split(range, vy_lsm_range_size(lsm),
-				  &split_key_raw))
-		return false;
+	if (!vy_range_needs_split(range, vy_lsm_range_size(lsm), &split_key_raw))
+		return 0;
 
 	/* Split a range in two parts. */
 	const int n_parts = 2;
@@ -1186,7 +1197,8 @@ vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range)
 		vy_slice_wait_pinned(slice);
 	vy_range_delete(range);
 	tuple_unref(split_key.stmt);
-	return true;
+	*was_split = true;
+	return 0;
 fail:
 	for (int i = 0; i < n_parts; i++) {
 		if (parts[i] != NULL)
@@ -1198,7 +1210,7 @@ fail:
 	diag_log();
 	say_error("%s: failed to split range %s",
 		  vy_lsm_name(lsm), vy_range_str(range));
-	return false;
+	return 0;
 }
 
 bool
@@ -1325,8 +1337,8 @@ vy_lsm_quantile(struct vy_lsm *lsm, double level,
 		if (!rlist_empty(&range->slices)) {
 			struct vy_slice *slice = rlist_last_entry(
 				&range->slices, struct vy_slice, in_range);
-			total += vy_run_estimate_stmt_count(
-				slice->run, cmp_def, range_begin, range_end);
+			total += vy_run_estimate_stmt_count(slice->run, cmp_def,
+							    range_begin, range_end);
 		}
 		if (range == last_range)
 			break;
@@ -1348,19 +1360,20 @@ vy_lsm_quantile(struct vy_lsm *lsm, double level,
 			range == first_range ? begin : range->begin;
 		struct vy_entry range_end =
 			range == last_range ? end : range->end;
-		if (rlist_empty(&range->slices))
-			continue;
-		struct vy_slice *slice = rlist_last_entry(
-			&range->slices, struct vy_slice, in_range);
-		int64_t count = vy_run_estimate_stmt_count(
-			slice->run, cmp_def, range_begin, range_end);
-		if (offset >= count) {
+		if (!rlist_empty(&range->slices)) {
+			struct vy_slice *slice = rlist_last_entry(
+				&range->slices, struct vy_slice, in_range);
+			int64_t count = vy_run_estimate_stmt_count(slice->run, cmp_def,
+						range_begin, range_end);
+			if (offset < count) {
+				key = vy_run_estimate_key_at(slice->run, cmp_def,
+							     range_begin, offset);
+				break;
+			}
 			offset -= count;
-			continue;
 		}
-		key = vy_run_estimate_key_at(slice->run, cmp_def,
-					     range_begin, offset);
-		break;
+		if (range == last_range)
+			break;
 	}
 	if (key == NULL)
 		return 0;

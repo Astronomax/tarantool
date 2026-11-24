@@ -1041,6 +1041,42 @@ return schema.new('instance_config', schema.record({
             box_cfg_nondynamic = true,
             default = 8 * 1024,
         }),
+        page_index_btree_in_memory_depth_max = schema.scalar({
+            type = 'integer',
+            box_cfg = 'vinyl_page_index_btree_in_memory_depth_max',
+            box_cfg_nondynamic = true,
+            default = 1,
+        }),
+        page_index_btree_on_disk_depth_min = schema.scalar({
+            type = 'integer',
+            box_cfg = 'vinyl_page_index_btree_on_disk_depth_min',
+            box_cfg_nondynamic = true,
+            default = 1,
+        }),
+        page_index_btree_fanout = schema.scalar({
+            type = 'integer',
+            box_cfg = 'vinyl_page_index_btree_fanout',
+            box_cfg_nondynamic = true,
+            default = 64,
+        }),
+        page_index_cache = schema.scalar({
+            type = 'integer',
+            box_cfg = 'vinyl_page_index_cache',
+            box_cfg_nondynamic = true,
+            default = 40 * 1024,
+        }),
+        page_info_cache = schema.scalar({
+            type = 'integer',
+            box_cfg = 'vinyl_page_info_cache',
+            box_cfg_nondynamic = true,
+            default = 160 * 1024,
+        }),
+        page_info_block_size = schema.scalar({
+            type = 'integer',
+            box_cfg = 'vinyl_page_info_block_size',
+            box_cfg_nondynamic = true,
+            default = 64,
+        }),
         range_size = schema.scalar({
             type = 'integer',
             box_cfg = 'vinyl_range_size',

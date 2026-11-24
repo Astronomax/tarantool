@@ -1954,8 +1954,20 @@ box_check_vinyl_options(void)
 	int run_count_per_level = cfg_geti("vinyl_run_count_per_level");
 	double run_size_ratio = cfg_getd("vinyl_run_size_ratio");
 	double bloom_fpr = cfg_getd("vinyl_bloom_fpr");
+	int page_index_btree_in_memory_depth_max =
+		cfg_geti("vinyl_page_index_btree_in_memory_depth_max");
+	int page_index_btree_on_disk_depth_min =
+		cfg_geti("vinyl_page_index_btree_on_disk_depth_min");
+	int page_index_btree_fanout =
+		cfg_geti("vinyl_page_index_btree_fanout");
+	int page_info_block_size =
+		cfg_geti("vinyl_page_info_block_size");
 
 	if (box_check_memory_quota("vinyl_memory") < 0)
+		diag_raise();
+	if (box_check_memory_quota("vinyl_page_index_cache") < 0)
+		diag_raise();
+	if (box_check_memory_quota("vinyl_page_info_cache") < 0)
 		diag_raise();
 
 	if (read_threads < 1) {
@@ -1982,6 +1994,28 @@ box_check_vinyl_options(void)
 	if (bloom_fpr <= 0 || bloom_fpr > 1) {
 		tnt_raise(ClientError, ER_CFG, "vinyl_bloom_fpr",
 			  "must be greater than 0 and less than or equal to 1");
+	}
+	if (page_index_btree_in_memory_depth_max < 0) {
+		tnt_raise(ClientError, ER_CFG,
+			  "vinyl_page_index_btree_in_memory_depth_max",
+			  "must be greater than or equal to 0");
+	}
+	if (page_index_btree_on_disk_depth_min < 0) {
+		tnt_raise(ClientError, ER_CFG,
+			  "vinyl_page_index_btree_on_disk_depth_min",
+			  "must be greater than or equal to 0");
+	}
+	if (page_index_btree_fanout < 2 ||
+	    page_index_btree_fanout > 128) {
+		tnt_raise(ClientError, ER_CFG,
+			  "vinyl_page_index_btree_fanout",
+			  "must be greater than or equal to 2 and "
+			  "less than or equal to 128");
+	}
+	if (page_info_block_size < 1 || page_info_block_size > 1024) {
+		tnt_raise(ClientError, ER_CFG,
+			  "vinyl_page_info_block_size",
+			  "must be greater than 0 and less than or equal to 1024");
 	}
 }
 

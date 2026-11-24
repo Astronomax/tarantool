@@ -75,6 +75,8 @@ test_basic()
 
 	struct vy_run_env run_env;
 	vy_run_env_create(&run_env, 0);
+	run_env.page_index_env.fanout = 4;
+	run_env.page_index_env.leaf_size = 4;
 
 	struct vy_cache_env cache_env;
 	vy_cache_env_create(&cache_env, slab_cache);
@@ -210,8 +212,8 @@ test_basic()
 	vy_mem_delete(run_mem);
 
 	vy_lsm_add_run(pk, run);
-	struct vy_slice *slice = vy_slice_new(1, run, vy_entry_none(),
-					      vy_entry_none(), pk->cmp_def);
+	struct vy_slice *slice = vy_slice_new(1, run, pk->cmp_def, vy_entry_none(),
+					      vy_entry_none());
 	vy_range_add_slice(range, slice);
 	vy_run_unref(run);
 
@@ -241,8 +243,7 @@ test_basic()
 	vy_mem_delete(run_mem);
 
 	vy_lsm_add_run(pk, run);
-	slice = vy_slice_new(1, run, vy_entry_none(), vy_entry_none(),
-			     pk->cmp_def);
+	slice = vy_slice_new(1, run, pk->cmp_def, vy_entry_none(), vy_entry_none());
 	vy_range_add_slice(range, slice);
 	vy_run_unref(run);
 

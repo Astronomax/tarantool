@@ -93,6 +93,7 @@ function gstat()
     st.scheduler.dump_time = nil
     st.scheduler.compaction_time = nil
     st.memory.level0 = nil
+    st.page_index = nil
     return st
 end;
 

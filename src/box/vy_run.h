@@ -42,8 +42,10 @@
 #include "vy_stat.h"
 #include "index_def.h"
 #include "xlog.h"
+#include "vy_page_index.h"
 
 #include "small/mempool.h"
+#include "cbus.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -74,6 +76,8 @@ struct vy_run_env {
 	 * unconditionally remove unused runs' files in-place.
 	 */
 	bool initial_join;
+	/** Cache environment for vy_page_index objects. */
+	struct vy_page_index_env page_index_env;
 };
 
 /**
@@ -94,10 +98,15 @@ struct vy_run_info {
 	struct tuple_bloom *bloom;
 	/** Statement statistics. */
 	struct vy_stmt_stat stmt_stat;
+	/**
+	 * Index file format version
+	 * (0/1: keys in .index, 2: separate .btree, 3: blocked B+ tree).
+	 */
+	uint32_t index_format_version;
 };
 
 /**
- * Run page metadata. Is a written to a file as a single chunk.
+ * Descriptor of one independently readable data page.
  */
 struct vy_page_info {
 	/** Offset of page data in the run file. */
@@ -108,10 +117,6 @@ struct vy_page_info {
 	uint32_t unpacked_size;
 	/** Number of statements in the page. */
 	uint32_t row_count;
-	/** Minimal key stored in the page. */
-	char *min_key;
-	/** Comparison hint of the min key. */
-	hint_t min_key_hint;
 	/** Offset of the row index in the page. */
 	uint32_t row_index_offset;
 };
@@ -124,8 +129,8 @@ struct vy_run {
 	struct vy_run_env *env;
 	/** Info about the run stored in the index file. */
 	struct vy_run_info info;
-	/** Info about the run pages stored in the index file. */
-	struct vy_page_info *page_info;
+	/** Page index (cache + on-disk btree + page metadata). */
+	struct vy_page_index page_index;
 	/** Run data file. */
 	int fd;
 	/** Unique ID of this run. */
@@ -134,6 +139,8 @@ struct vy_run {
 	struct vy_disk_stmt_counter count;
 	/** Size of memory used for storing page index. */
 	size_t page_index_size;
+	/** Size of run metadata index file on disk (.index). */
+	size_t page_index_disk_size;
 	/** Max LSN stored on disk. */
 	int64_t dump_lsn;
 	/**
@@ -222,6 +229,7 @@ struct vy_slice {
 	uint32_t last_page_no;
 	/** An estimate of the number of statements in this slice. */
 	struct vy_disk_stmt_counter count;
+
 };
 
 /** Position of a particular stmt in vy_run. */
@@ -257,6 +265,8 @@ struct vy_run_iterator {
 	struct tuple_format *format;
 	/** The run slice to iterate. */
 	struct vy_slice *slice;
+	/** The run kept alive while the iterator holds page index nodes. */
+	struct vy_run *run;
 
 	/* Search options */
 	/**
@@ -341,12 +351,8 @@ vy_run_env_enable_coio(struct vy_run_env *env);
 size_t
 vy_run_bloom_size(struct vy_run *run);
 
-static inline struct vy_page_info *
-vy_run_page_info(struct vy_run *run, uint32_t pos)
-{
-	assert(pos < run->info.page_count);
-	return &run->page_info[pos];
-}
+ZSTD_DStream *
+vy_run_env_get_zdctx(struct vy_run_env *env);
 
 static inline bool
 vy_run_is_empty(struct vy_run *run)
@@ -404,7 +410,8 @@ vy_run_estimate_key_at(struct vy_run *run, struct key_def *cmp_def,
  */
 int
 vy_run_recover(struct vy_run *run, const char *dir,
-	       uint32_t space_id, uint32_t iid, struct key_def *cmp_def);
+	       uint32_t space_id, uint32_t iid, struct key_def *cmp_def,
+	       bool force_recovery);
 
 /**
  * Rebuild run index
@@ -428,8 +435,12 @@ vy_run_rebuild_index(struct vy_run *run, const char *dir,
 enum vy_file_type {
 	VY_FILE_INDEX,
 	VY_FILE_INDEX_INPROGRESS,
+	VY_FILE_INDEX_OFFSETS,
+	VY_FILE_INDEX_OFFSETS_INPROGRESS,
 	VY_FILE_RUN,
 	VY_FILE_RUN_INPROGRESS,
+	VY_FILE_PAGE_INDEX,
+	VY_FILE_PAGE_INDEX_INPROGRESS,
 	vy_file_MAX,
 };
 
@@ -486,10 +497,11 @@ vy_run_remove_files(const char *dir, uint32_t space_id,
 /**
  * Allocate a new run slice.
  * This function increments @run->refs.
+ * Uses resident key samples to estimate the size without yielding.
  */
 struct vy_slice *
-vy_slice_new(int64_t id, struct vy_run *run, struct vy_entry begin,
-	     struct vy_entry end, struct key_def *cmp_def);
+vy_slice_new(int64_t id, struct vy_run *run, struct key_def *cmp_def,
+	     struct vy_entry begin, struct vy_entry end);
 
 /**
  * Free a run slice.
@@ -591,6 +603,8 @@ struct vy_slice_stream {
 	/** Current position */
 	uint32_t page_no;
 	uint32_t pos_in_page;
+	uint32_t last_page_no;
+	struct vy_index_node *index_leaf;
 	/** Last page read */
 	struct vy_page *page;
 	/** The last tuple returned to user */
@@ -641,10 +655,12 @@ struct vy_run_writer {
 	 * dumped.
 	 */
 	uint64_t page_size;
-	/**
-	 * Current page info capacity. Can grow with page number.
-	 */
-	uint32_t page_info_capacity;
+	/** Page under construction and its owned fence key. */
+	struct vy_page_info page;
+	char *page_min_key;
+	/** Streams completed nodes to the index alongside the data pages. */
+	struct vy_page_index_writer *index;
+	struct xlog index_xlog;
 	/** Don't use compression while writing xlog files. */
 	bool no_compression;
 	/** Xlog to write data. */

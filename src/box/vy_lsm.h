@@ -90,8 +90,8 @@ struct vy_lsm_env {
 	int lsm_count;
 	/** Size of memory used for bloom filters. */
 	size_t bloom_size;
-	/** Size of memory used for page index. */
-	size_t page_index_size;
+	/** Total size of on-disk run metadata index files (.index). */
+	int64_t page_index_disk_size;
 	/**
 	 * Size of disk space used for storing data of all spaces,
 	 * in bytes, without taking into account disk compression.
@@ -106,6 +106,8 @@ struct vy_lsm_env {
 	 * are stored in .index files, as well as the total size of
 	 * statements stored in secondary index .run files, which
 	 * is consistent with index.bsize().
+	 *
+	 * TODO: account btree and offsets files.
 	 */
 	int64_t disk_index_size;
 	/**
@@ -583,8 +585,9 @@ vy_lsm_find_range_intersection(struct vy_lsm *lsm,
  * the change in the metadata log, i.e. it doesn't involve heavy
  * operations, like writing a run file, and is done immediately.
  */
-bool
-vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range);
+int
+vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range,
+		   bool *was_split);
 
 /**
  * Coalesce a range with one or more its neighbors if it is too small,

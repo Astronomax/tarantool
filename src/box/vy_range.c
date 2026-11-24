@@ -31,6 +31,7 @@
 #include "vy_range.h"
 
 #include <assert.h>
+#include "mp_util.h"
 #include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -469,18 +470,12 @@ vy_range_needs_split(struct vy_range *range, int64_t range_size,
 	if (slice->count.bytes < range_size * 4 / 3)
 		return false;
 
-	/* Find the median key in the oldest run (approximately). */
-	struct vy_page_info *mid_page;
-	mid_page = vy_run_page_info(slice->run, slice->first_page_no +
-				    (slice->last_page_no -
-				     slice->first_page_no) / 2);
-
-	struct vy_page_info *first_page = vy_run_page_info(slice->run,
-						slice->first_page_no);
-
+	uint32_t first = slice->first_page_no;
+	uint32_t mid = first + (slice->last_page_no - first) / 2;
+	const char *first_min = vy_page_index_sample_key(slice->run, first);
+	const char *mid_min = vy_page_index_sample_key(slice->run, mid);
 	/* No point in splitting if a new range is going to be empty. */
-	if (vy_key_compare(first_page->min_key, first_page->min_key_hint,
-			   mid_page->min_key, mid_page->min_key_hint,
+	if (vy_key_compare(first_min, HINT_NONE, mid_min, HINT_NONE,
 			   range->cmp_def) == 0)
 		return false;
 	/*
@@ -500,8 +495,7 @@ vy_range_needs_split(struct vy_range *range, int64_t range_size,
 	 * In such cases there's no point in splitting the range.
 	 */
 	if (slice->begin.stmt != NULL &&
-	    vy_entry_compare_with_raw_key(slice->begin, mid_page->min_key,
-					  mid_page->min_key_hint,
+	    vy_entry_compare_with_raw_key(slice->begin, mid_min, HINT_NONE,
 					  range->cmp_def) >= 0)
 		return false;
 	/*
@@ -509,10 +503,9 @@ vy_range_needs_split(struct vy_range *range, int64_t range_size,
 	 * take the min key of a page for the median key.
 	 */
 	assert(slice->end.stmt == NULL ||
-	       vy_entry_compare_with_raw_key(slice->end, mid_page->min_key,
-					     mid_page->min_key_hint,
+	       vy_entry_compare_with_raw_key(slice->end, mid_min, HINT_NONE,
 					     range->cmp_def) > 0);
-	*p_split_key = mid_page->min_key;
+	*p_split_key = mid_min;
 	return true;
 }
 

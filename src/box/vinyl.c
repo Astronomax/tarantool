@@ -30,6 +30,9 @@
  */
 #include "vinyl.h"
 
+#include <pmatomic.h>
+
+#include "cfg.h"
 #include "vy_mem.h"
 #include "vy_run.h"
 #include "vy_range.h"
@@ -293,12 +296,16 @@ vy_info_append_tx(struct vy_env *env, struct info_handler *h)
 static void
 vy_info_append_memory(struct vy_env *env, struct info_handler *h)
 {
+	struct vy_page_index_env *pi = &env->run_env.page_index_env;
+	int64_t page_index_mem = pm_atomic_load(&pi->resident_bytes) +
+				 pi->inner.mem_used + pi->leaf.mem_used;
+
 	info_table_begin(h, "memory");
 	info_append_int(h, "tx", vy_tx_manager_mem_used(env->xm));
 	info_append_int(h, "level0", lsregion_used(&env->mem_env.allocator));
 	info_append_int(h, "tuple", env->stmt_env.sum_tuple_size);
 	info_append_int(h, "tuple_cache", env->cache_env.mem_used);
-	info_append_int(h, "page_index", env->lsm_env.page_index_size);
+	info_append_int(h, "page_index", page_index_mem);
 	info_append_int(h, "bloom_filter", env->lsm_env.bloom_size);
 	info_table_end(h); /* memory */
 }
@@ -313,6 +320,49 @@ vy_info_append_disk(struct vy_env *env, struct info_handler *h)
 	info_table_end(h); /* disk */
 }
 
+static void
+vy_info_append_page_index(struct vy_env *env, struct info_handler *h)
+{
+	struct vy_page_index_env *pi = &env->run_env.page_index_env;
+	struct vy_index_cache *kc = &pi->inner;
+	struct vy_index_cache *pc = &pi->leaf;
+
+	info_table_begin(h, "page_index");
+
+	info_table_begin(h, "key_cache");
+	info_append_int(h, "hit", kc->hit);
+	info_append_int(h, "miss", kc->miss);
+	info_append_int(h, "evict", kc->evict);
+	info_append_int(h, "mem_used", kc->mem_used);
+	info_append_int(h, "mem_quota", kc->mem_quota);
+	info_table_end(h); /* key_cache */
+
+	info_table_begin(h, "page_info_cache");
+	info_append_int(h, "hit", pc->hit);
+	info_append_int(h, "miss", pc->miss);
+	info_append_int(h, "evict", pc->evict);
+	info_append_int(h, "pinned", 0);
+	info_append_int(h, "mem_used", pc->mem_used);
+	info_append_int(h, "mem_quota", pc->mem_quota);
+	info_table_end(h); /* page_info_cache */
+
+	info_table_begin(h, "io");
+	info_append_int(h, "read_bytes", pm_atomic_load(&pi->read_bytes));
+	info_append_int(h, "read_ops", pm_atomic_load(&pi->read_ops));
+	info_append_int(h, "write_bytes", pm_atomic_load(&pi->write_bytes));
+	info_table_end(h); /* io */
+
+	info_table_begin(h, "disk");
+	info_append_int(h, "index_bytes", env->lsm_env.page_index_disk_size);
+	/* Retain the counters for legacy companion files in the public stats. */
+	info_append_int(h, "btree_bytes", 0);
+	info_append_int(h, "offsets_bytes", 0);
+	info_append_int(h, "bytes", env->lsm_env.page_index_disk_size);
+	info_table_end(h); /* disk */
+
+	info_table_end(h); /* page_index */
+}
+
 void
 vinyl_engine_stat(struct engine *engine, struct info_handler *h)
 {
@@ -322,6 +372,7 @@ vinyl_engine_stat(struct engine *engine, struct info_handler *h)
 	vy_info_append_tx(env, h);
 	vy_info_append_memory(env, h);
 	vy_info_append_disk(env, h);
+	vy_info_append_page_index(env, h);
 	vy_info_append_scheduler(env, h);
 	vy_info_append_regulator(env, h);
 	info_end(h);
@@ -510,7 +561,9 @@ vinyl_engine_memory_stat(struct engine *engine, struct engine_memory_stat *stat)
 				env->mem_env.tree_extent_size;
 	stat->index += env->mem_env.tree_extent_size;
 	stat->index += env->lsm_env.bloom_size;
-	stat->index += env->lsm_env.page_index_size;
+	struct vy_page_index_env *pi = &env->run_env.page_index_env;
+	stat->index += pm_atomic_load(&pi->resident_bytes);
+	stat->cache += pi->inner.mem_used + pi->leaf.mem_used;
 	stat->cache += env->cache_env.mem_used;
 	stat->tx += vy_tx_manager_mem_used(env->xm);
 }
@@ -2776,6 +2829,13 @@ vy_env_new(const char *path, size_t memory,
 	               sizeof(struct vinyl_iterator));
 	vy_cache_env_create(&e->cache_env, slab_cache);
 	vy_run_env_create(&e->run_env, read_threads);
+	struct vy_page_index_env *pi = &e->run_env.page_index_env;
+	pi->inner.mem_quota = cfg_geti64("vinyl_page_index_cache");
+	pi->leaf.mem_quota = cfg_geti64("vinyl_page_info_cache");
+	pi->resident_depth = cfg_geti("vinyl_page_index_btree_in_memory_depth_max");
+	pi->disk_depth = cfg_geti("vinyl_page_index_btree_on_disk_depth_min");
+	pi->fanout = cfg_geti("vinyl_page_index_btree_fanout");
+	pi->leaf_size = cfg_geti("vinyl_page_info_block_size");
 	vy_log_init(e->path);
 	return e;
 
@@ -3457,14 +3517,23 @@ vinyl_engine_backup(struct engine *engine, const struct vclock *vclock,
 				continue;
 			char path[PATH_MAX];
 			for (int type = 0; type < vy_file_MAX; type++) {
-				if (type == VY_FILE_RUN_INPROGRESS ||
-				    type == VY_FILE_INDEX_INPROGRESS)
+				bool legacy = type == VY_FILE_PAGE_INDEX ||
+					      type == VY_FILE_INDEX_OFFSETS;
+				if (type != VY_FILE_RUN && type != VY_FILE_INDEX && !legacy)
 					continue;
 				vy_run_snprint_path(path, sizeof(path),
 						    env->path,
 						    lsm_info->space_id,
 						    lsm_info->index_id,
 						    run_info->id, type);
+				/* Older checkpoints may still reference pre-v3 runs. */
+				if (legacy && access(path, F_OK) != 0) {
+					if (errno == ENOENT)
+						continue;
+					diag_set(SystemError, "access %s", path);
+					rc = -1;
+					goto out;
+				}
 				rc = cb(path, cb_arg);
 				if (rc != 0)
 					goto out;
