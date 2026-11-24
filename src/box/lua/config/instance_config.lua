@@ -1063,13 +1063,13 @@ return schema.new('instance_config', schema.record({
             type = 'integer',
             box_cfg = 'vinyl_page_index_cache',
             box_cfg_nondynamic = true,
-            default = 10000,
+            default = 40 * 1024,
         }),
         page_info_cache = schema.scalar({
             type = 'integer',
             box_cfg = 'vinyl_page_info_cache',
             box_cfg_nondynamic = true,
-            default = 10000,
+            default = 160 * 1024,
         }),
         page_info_block_size = schema.scalar({
             type = 'integer',

@@ -1,445 +1,153 @@
 #ifndef INCLUDES_TARANTOOL_BOX_VY_PAGE_INDEX_H
 #define INCLUDES_TARANTOOL_BOX_VY_PAGE_INDEX_H
 
-#include <stdbool.h>
-#include <stddef.h>
-
-#include "key_def.h"
-#include "iterator_type.h"
 #include "vy_stmt.h"
+#include "iterator_type.h"
 #include "small/rlist.h"
-#include "small/matras.h"
 
 #if defined(__cplusplus)
 extern "C" {
-#endif /* defined(__cplusplus) */
+#endif
 
-struct vy_page_info;
-struct vy_run_env;
+enum { VY_PAGE_INDEX_VERSION = 3 };
 
-/** Page index entry. */
-struct vy_page_index_entry {
-	/** Index in sorted array. */
-	int32_t idx;
-	/** Minimal key stored in the page. */
-	char *min_key;
-	/** Comparison hint of the min key. */
-	hint_t min_key_hint;
+struct vy_run;
+struct xlog;
+struct xlog_cursor;
+
+/** Address of one independently checksummed xlog transaction. */
+struct vy_index_ref {
+	uint64_t offset;
+	uint32_t size;
+	uint32_t unpacked_size;
 };
 
-/* {{{ Page Index Cache */
+struct vy_index_node;
 
-struct vy_page_index_cache;
-
-struct vy_page_index_cache_node {
-	struct vy_page_index_cache *cache;
-	struct vy_page_index_entry entry;
-	struct rlist in_lru;
-};
-
-enum {
-	/* Max number of deletes that are made by cleanup action per one
-	 * cache operation */
-	VY_PAGE_INDEX_CACHE_CLEANUP_MAX_STEPS = 10,
-};
-
-static inline int
-vy_page_index_entry_compare(const struct vy_page_index_entry *a,
-			    const struct vy_page_index_entry *b,
-			    struct key_def *cmp_def)
-{
-	(void)cmp_def;
-	return (int)a->idx - (int)b->idx;
-}
-
-static inline int
-vy_page_index_entry_compare_with_key(const struct vy_page_index_entry *entry,
-			     struct vy_entry key, struct key_def *cmp_def)
-{
-	return vy_entry_compare_with_raw_key(key, entry->min_key,
-					     entry->min_key_hint, cmp_def);
-}
-
-static inline int
-vy_page_index_cache_tree_cmp(struct vy_page_index_cache_node *a,
-			     struct vy_page_index_cache_node *b,
-			     struct key_def *cmp_def)
-{
-	(void)cmp_def;
-	return vy_page_index_entry_compare(&a->entry, &b->entry, cmp_def);
-}
-
-static inline int
-vy_page_index_cache_tree_key_cmp(struct vy_page_index_cache_node *a,
-				 struct vy_entry b,
-				 struct key_def *cmp_def)
-{
-	return -vy_page_index_entry_compare_with_key(&a->entry, b, cmp_def);
-}
-
-#define VY_PAGE_INDEX_CACHE_TREE_EXTENT_SIZE 512//(16 * 1024)
-
-#define BPS_TREE_NAME vy_page_index_cache_tree
-#define BPS_TREE_BLOCK_SIZE 512
-#define BPS_TREE_COMPARE(a, b, cmp_def) \
-	vy_page_index_cache_tree_cmp(a, b, cmp_def)
-#define BPS_TREE_COMPARE_KEY(a, b, cmp_def) \
-	vy_page_index_cache_tree_key_cmp(a, b, cmp_def)
-#define bps_tree_elem_t struct vy_page_index_cache_node *
-#define bps_tree_key_t struct vy_entry
-#define bps_tree_arg_t struct key_def *
-#define BPS_TREE_IS_IDENTICAL(a, b) ((a)->entry.idx == (b)->entry.idx)
-
-#include "salad/bps_tree.h"
-
-#undef BPS_TREE_NAME
-#undef BPS_TREE_BLOCK_SIZE
-#undef BPS_TREE_COMPARE
-#undef BPS_TREE_COMPARE_KEY
-#undef bps_tree_elem_t
-#undef bps_tree_key_t
-#undef bps_tree_arg_t
-#undef BPS_TREE_IS_IDENTICAL
-
-struct vy_page_index_cache_env {
-	/** Back-pointer for coio offload. */
-	struct vy_run_env *run_env;
-	struct rlist cache_lru;
-	struct mempool cache_node_mempool;
-	struct matras_allocator allocator;
-	/**
-	 * Memory occupied by matras extents backing the cache tree.
-	 * This memory is allocated/freed together with the allocator,
-	 * not with individual cache nodes.
-	 */
-	size_t tree_mem_used;
-	/** In-memory .btree levels (vy_page_index_btree), all runs on this env. */
-	size_t btree_mem_used;
+/** Global TX cache for either internal nodes or leaves. */
+struct vy_index_cache {
+	struct rlist lru;
+	struct rlist *buckets;
+	size_t bucket_count;
 	size_t mem_used;
 	size_t mem_quota;
-	/** Max number of upper B-tree levels to keep resident. */
-	uint32_t btree_in_memory_depth_max;
-	/** Min number of lower B-tree levels to keep on disk. */
-	uint32_t btree_on_disk_depth_min;
-	/** Max keys per B-tree node (fanout). 0 = default at runtime. */
-	uint32_t btree_order;
-	/**
-	 * Read-ahead for on-demand B-tree node reads. Starts at the default;
-	 * after each node read becomes the average on-disk node size seen so far.
-	 */
-	size_t btree_read_ahead;
-	uint64_t btree_read_node_bytes_sum;
-	uint64_t btree_read_node_count;
-	/** Cache stats. */
-	struct {
-		int64_t hit;
-		int64_t miss;
-		int64_t evict;
-	} stat;
-	/** IO stats. */
-	struct {
-		int64_t read_bytes;
-		int64_t read_ops;
-		int64_t write_bytes;
-	} io;
+	int64_t hit, miss, evict;
 };
 
-struct vy_page_index_cache {
-	/** Number of pages in the run. */
-	uint32_t page_count;
-	struct key_def *cmp_def;
-	struct vy_page_index_cache_tree cache_tree;
-	struct vy_page_index_cache_env *env;
-	/** Matras stats for cache_tree. */
-	struct matras_stats matras_stats;
-};
-
-void
-vy_page_index_cache_env_create(struct vy_page_index_cache_env *env,
-			       struct slab_cache *slabc);
-
-void
-vy_page_index_cache_env_destroy(struct vy_page_index_cache_env *env);
-
-/* }}} Page Index Cache */
-
-/* {{{ B-tree */
-
-struct vy_page_index_btree_node;
-
-/** B-tree structure. */
-struct vy_page_index_btree {
-	/** Number of pages in the run. */
-	uint32_t page_count;
-	/** Key definition for comparison. */
-	struct key_def *cmp_def;
-	/** For I/O accounting. */
-	struct vy_page_index_cache_env *env;
-	/** Root node offset in file. */
-	uint64_t root_offset;
-	/** Offset of btree binary payload in file. */
-	uint64_t data_offset;
-	/** Filepath of the .btree file. */
-	char *filepath;
-	/** File descriptor for reading, lifetime is bound to run object. */
-	int fd;
-	/**
-	 * Max number of upper B-tree levels to keep resident.
-	 */
-	uint32_t in_memory_depth_max;
-	/**
-	 * Min number of lower B-tree levels to keep on disk.
-	 */
-	uint32_t on_disk_depth_min;
-	/** Depth of the in memory part of the tree. */
-	uint32_t in_memory_depth;
-	/** In memory root node. */
-	struct vy_page_index_btree_node *root;
-};
-
-/* }}} B-tree */
-
-/* {{{ Page Info Cache */
-
-struct vy_page_info_cache;
-
-struct vy_page_info_block {
-	uint32_t l;
-	uint32_t r;
-	/**
-	 * Array of size (r - l) with page infos for pages [l, r).
-	 * Owned by the block and freed by vy_page_info_block_destroy().
-	 */
-	struct vy_page_info *data;
-	/**
-	 * Raw data buffer containing the decoded page infos.
-	 * If not NULL, min_key pointers in data point inside this buffer.
-	 */
-	char *raw_data;
-	size_t raw_data_size;
-};
-
-struct vy_page_info_cache_node {
-	struct vy_page_info_cache *cache;
-	struct vy_page_info_block block;
-	/** Number of iterators currently pinned to this node. */
-	uint32_t pin_count;
-	struct rlist in_lru;
-};
-
-enum {
-	/* Max number of deletes that are made by cleanup action per one
-	 * cache operation */
-	VY_PAGE_INFO_CACHE_CLEANUP_MAX_STEPS = 10,
-};
-
-static inline int
-vy_page_info_cache_tree_cmp(struct vy_page_info_cache_node *a,
-			    struct vy_page_info_cache_node *b,
-			    void *unused)
-{
-	(void)unused;
-	return (int)a->block.l - (int)b->block.l;
-}
-
-static inline int
-vy_page_info_cache_tree_key_cmp(struct vy_page_info_cache_node *a,
-				uint32_t b, void *unused)
-{
-	(void)unused;
-	return (int)a->block.r - (int)b;
-}
-
-#define VY_PAGE_INFO_CACHE_TREE_EXTENT_SIZE 512//(16 * 1024)
-
-#define BPS_TREE_NAME vy_page_info_cache_tree
-#define BPS_TREE_BLOCK_SIZE 512
-#define BPS_TREE_COMPARE(a, b, unused) \
-	vy_page_info_cache_tree_cmp(a, b, unused)
-#define BPS_TREE_COMPARE_KEY(a, b, unused) \
-	vy_page_info_cache_tree_key_cmp(a, b, unused)
-#define bps_tree_elem_t struct vy_page_info_cache_node *
-#define bps_tree_key_t uint32_t
-#define bps_tree_arg_t void *
-#define BPS_TREE_IS_IDENTICAL(a, b) ((a)->block.l == (b)->block.l)
-
-#include "salad/bps_tree.h"
-
-#undef BPS_TREE_NAME
-#undef BPS_TREE_BLOCK_SIZE
-#undef BPS_TREE_COMPARE
-#undef BPS_TREE_COMPARE_KEY
-#undef bps_tree_elem_t
-#undef bps_tree_key_t
-#undef bps_tree_arg_t
-#undef BPS_TREE_IS_IDENTICAL
-
-struct vy_page_info_cache_env {
-	/** Back-pointer for coio offload. */
-	struct vy_run_env *run_env;
-	/**
-	 * Page-info array block size in number of pages.
-	 * Controls granularity of I/O and caching for page info blocks.
-	 */
-	uint32_t block_size;
-	struct rlist cache_lru;
-	struct mempool cache_node_mempool;
-	struct matras_allocator allocator;
-	/**
-	 * Memory occupied by matras extents backing the cache tree.
-	 * This memory is allocated/freed together with the allocator,
-	 * not with individual cache nodes.
-	 */
-	size_t tree_mem_used;
-	size_t mem_used;
-	size_t mem_quota;
-	/** Cache stats. */
-	struct {
-		int64_t hit;
-		int64_t miss;
-		int64_t evict;
-		int64_t pinned;
-	} stat;
-	/** IO stats. */
-	struct {
-		int64_t read_bytes;
-		int64_t read_ops;
-		int64_t write_bytes;
-	} io;
-};
-
-struct vy_page_info_cache {
-	/** Number of pages in the run. */
-	uint32_t page_count;
-	struct vy_page_info_cache_tree cache_tree;
-	struct vy_page_info_cache_env *env;
-	/** Matras stats for cache_tree. */
-	struct matras_stats matras_stats;
-};
-
-void
-vy_page_info_cache_env_create(struct vy_page_info_cache_env *env,
-			      struct slab_cache *slabc);
-
-void
-vy_page_info_cache_env_destroy(struct vy_page_info_cache_env *env);
-
-/* }}} Page Info Cache */
-
-/* {{{ Page Info Array */
-
-struct vy_page_index_array {
-	struct key_def *cmp_def;
-	uint32_t page_count;
-	/** Cache. */
-	struct vy_page_info_cache cache;
-	/** Source of truth. */
-	int index_fd;
-	const char *index_filepath;
-	int index_offsets_fd;
-	const char *index_offsets_filepath;
-	/**
-	 * Transitional in-memory source for blocks that are not loaded from disk
-	 * yet. If set, entries can point directly to this array.
-	 */
-	struct vy_page_info *page_info;
+struct vy_page_index_env {
+	struct vy_index_cache inner, leaf;
+	uint32_t resident_depth, disk_depth, fanout, leaf_size;
+	int64_t resident_bytes, read_bytes, read_ops, write_bytes;
 };
 
 struct vy_page_index {
-	/** Number of pages in the run. */
-	uint32_t page_count;
-	/** Cache. */
-	struct vy_page_index_cache cache;
-	/** Source of truth. */
-	struct vy_page_index_btree btree;
-	/** Page info array. */
-	struct vy_page_index_array page_info;
+	int fd;
+	struct vy_index_ref root;
+	struct vy_index_node *resident;
+	uint32_t key_part_count;
+	struct rlist cached;
+	uint32_t height;
+	uint64_t root_stride;
+	uint32_t leaf_size;
+	uint32_t fanout;
+	/** Sample i is the minimum key of data page i * sample_stride. */
+	uint32_t sample_stride;
+	uint32_t sample_count;
+	const char **samples;
 };
-
-struct vy_page_index_array_iterator {
-	struct vy_page_info_cache_tree_iterator cache_it;
-	struct vy_page_info_cache_node *node;
-	uint32_t page_no;
-};
-
-void
-vy_page_info_block_destroy(struct vy_page_info_block *block);
-
-struct vy_page_index_array_iterator
-vy_page_index_array_invalid_iterator(void);
-
-struct vy_page_info *
-vy_page_index_array_iterator_get(struct vy_page_index_array_iterator *it);
-
-int
-vy_page_index_array_iterator_next(struct vy_page_index_array *array,
-				 struct vy_page_index_array_iterator *it);
-
-int
-vy_page_index_array_iterator_prev(struct vy_page_index_array *array,
-				 struct vy_page_index_array_iterator *it);
-
-struct vy_page_info *
-vy_page_index_array_iterator_get(struct vy_page_index_array_iterator *it);
-
-void
-vy_page_index_array_iterator_close(struct vy_page_index_array_iterator *it);
-
-int
-vy_page_index_read_page_info_block(struct vy_page_index *index,
-				   uint32_t block_idx,
-				   struct vy_page_info_block *result);
-
-int
-vy_page_index_recover(struct vy_page_index *index,
-		      const char *index_path,
-		      const char *index_btree_path,
-		      const char *index_offsets_path,
-		      struct vy_page_index_cache_env *page_index_cache_env,
-		      struct vy_page_info_cache_env *page_info_cache_env,
-		      struct key_def *cmp_def,
-		      struct vy_page_index_entry *entries, uint32_t page_count);
-
-int
-vy_page_index_write(struct vy_page_index *index,
-		    struct vy_page_index_entry *entries,
-		    uint32_t page_count,
-		    const char *index_path,
-		    const char *index_btree_path,
-		    const char *index_offsets_path,
-		    struct vy_page_index_cache_env *page_index_cache_env,
-		    struct vy_page_info_cache_env *page_info_cache_env,
-		    struct key_def *cmp_def);
-
-/* }}} Page Info Array */
-
-/* {{{ Page Index */
-
-void
-vy_page_index_destroy(struct vy_page_index *index);
-int
-vy_page_index_find_page(struct vy_page_index *index, struct vy_entry key,
-			enum iterator_type itype,
-			uint32_t *result, bool *equal_key);
-
-int
-vy_page_index_get_key(struct vy_page_index *index, uint32_t page_no,
-		      struct vy_page_index_entry *result);
 
 /**
- * Get iterator positioned at page_no.
- * @retval 0 Success, iterator initialized.
- * @retval 1 Requested page doesn't exist.
- * @retval -1 Read/IO error.
+ * State transferred from TX to a reader on the first cache miss.
+ * A search by key is complete when page_no and info are known. A search
+ * by page number uses the same descent with key = vy_entry_none().
  */
-int
-vy_page_index_get_page(struct vy_page_index *index, uint32_t page_no,
-		       struct vy_page_index_array_iterator *it);
+struct vy_index_lookup {
+	struct vy_run *run;
+	struct key_def *cmp_def;
+	struct vy_entry key;
+	enum iterator_type type;
+	uint32_t page_no;
+	bool equal;
+	uint8_t inner_reads, leaf_reads;
+	struct vy_index_ref ref;
+	uint32_t level;
+	uint32_t first;
+	uint64_t stride;
+	/** Nodes private to this request, offered to the TX cache on return. */
+	struct rlist fetched;
+};
 
-/* }}} Page Index */
+struct vy_page_info;
+void
+vy_page_index_env_create(struct vy_page_index_env *env);
+void
+vy_page_index_env_destroy(struct vy_page_index_env *env);
+
+/** Returns true if info (or EOF) was resolved from resident/cached nodes. */
+bool
+vy_page_index_lookup(struct vy_index_lookup *lookup, struct vy_run *run,
+		     struct key_def *cmp_def, struct vy_entry key,
+		     enum iterator_type type, uint32_t page_no,
+		     struct vy_page_info *info);
+
+/** Complete a miss on the reader. Only immutable run state is shared. */
+int
+vy_page_index_read(struct vy_index_lookup *lookup, struct vy_page_info *info);
+void
+vy_page_index_lookup_done(struct vy_index_lookup *lookup);
+
+/** Synchronous lookup for a compaction stream, with its own leaf buffer. */
+int
+vy_page_index_stream_lookup(struct vy_run *run, struct vy_index_node **leaf,
+			    struct key_def *cmp_def, struct vy_entry key,
+			    enum iterator_type type, uint32_t *page_no,
+			    struct vy_page_info *info);
+void
+vy_page_index_stream_close(struct vy_index_node *leaf);
+
+/** Lower bound in the resident sample, in units of sample_stride pages. */
+uint32_t
+vy_page_index_sample_bound(struct vy_run *run, struct key_def *cmp_def,
+			   struct vy_entry key);
+
+/** Borrow the nearest sampled key at or before a page. Does not yield. */
+const char *
+vy_page_index_sample_key(struct vy_run *run, uint32_t page_no);
+
+struct vy_page_index_writer;
+struct vy_page_index_writer *
+vy_page_index_writer_new(struct vy_run *run, struct xlog *log);
+void
+vy_page_index_writer_delete(struct vy_page_index_writer *w);
+
+/** Transfer ownership of the page's min key on success. */
+int
+vy_page_index_writer_append(struct vy_page_index_writer *w, char *key,
+			    const struct vy_page_info *page);
+int
+vy_page_index_writer_finish(struct vy_page_index_writer *w,
+			    struct vy_index_ref *root);
+int
+vy_page_index_write_manifest(struct vy_page_index_writer *w, struct vy_run *run,
+			     struct vy_index_ref root, off_t run_info_offset);
+
+struct vy_index_trailer {
+	off_t start, run_info, manifest, end;
+};
+
+/** Returns 1 for format 3, 0 for a legacy index, or -1 on error. */
+int
+vy_page_index_read_trailer(struct vy_run *run, struct xlog_cursor *cursor,
+			   struct vy_index_trailer *trailer);
+int
+vy_page_index_open(struct vy_run *run, struct xlog_cursor *cursor,
+		   struct key_def *cmp_def, const struct vy_index_trailer *trailer,
+		   bool verify);
+
+void
+vy_page_index_destroy(struct vy_run *run);
 
 #if defined(__cplusplus)
-} /* extern "C" { */
-#endif /* defined(__cplusplus) */
-
-#endif /* INCLUDES_TARANTOOL_BOX_VY_PAGE_INDEX_H */
+} /* extern "C" */
+#endif
+#endif

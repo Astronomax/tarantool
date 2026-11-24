@@ -77,10 +77,7 @@ vy_lsm_env_create(struct vy_lsm_env *env, const char *path,
 		  void *upsert_thresh_arg)
 {
 	env->bloom_size = 0;
-	env->page_index_size = 0;
-	env->page_index_index_disk_size = 0;
-	env->page_index_btree_disk_size = 0;
-	env->page_index_offsets_disk_size = 0;
+	env->page_index_disk_size = 0;
 	env->disk_data_size = 0;
 	env->disk_index_size = 0;
 	env->compacted_data_size = 0;
@@ -366,7 +363,7 @@ vy_lsm_recover_run(struct vy_lsm *lsm, struct vy_run_recovery_info *run_info,
 	run->dump_lsn = run_info->dump_lsn;
 	run->dump_count = run_info->dump_count;
 	if (vy_run_recover(run, lsm->env->path, lsm->space_id, lsm->index_id,
-			   lsm->cmp_def) != 0 &&
+			   lsm->cmp_def, force_recovery) != 0 &&
 	    (!force_recovery ||
 	     vy_run_rebuild_index(run, lsm->env->path,
 				  lsm->space_id, lsm->index_id,
@@ -427,7 +424,7 @@ vy_lsm_recover_slice(struct vy_lsm *lsm, struct vy_range *range,
 	if (run == NULL)
 		goto out;
 
-	slice = vy_slice_new(slice_info->id, run, begin, end);
+	slice = vy_slice_new(slice_info->id, run, lsm->cmp_def, begin, end);
 	if (slice == NULL)
 		goto out;
 
@@ -742,9 +739,7 @@ vy_lsm_add_run(struct vy_lsm *lsm, struct vy_run *run)
 	struct vy_lsm_env *env = lsm->env;
 	size_t bloom_size = vy_run_bloom_size(run);
 	size_t page_index_size = run->page_index_size;
-	size_t page_index_index_disk_size = run->page_index_index_disk_size;
-	size_t page_index_btree_disk_size = run->page_index_btree_disk_size;
-	size_t page_index_offsets_disk_size = run->page_index_offsets_disk_size;
+	size_t page_index_disk_size = run->page_index_disk_size;
 
 	assert(rlist_empty(&run->in_lsm));
 	rlist_add_entry(&lsm->runs, run, in_lsm);
@@ -756,10 +751,7 @@ vy_lsm_add_run(struct vy_lsm *lsm, struct vy_run *run)
 	lsm->page_index_size += page_index_size;
 
 	env->bloom_size += bloom_size;
-	env->page_index_size += page_index_size;
-	env->page_index_index_disk_size += (int64_t)page_index_index_disk_size;
-	env->page_index_btree_disk_size += (int64_t)page_index_btree_disk_size;
-	env->page_index_offsets_disk_size += (int64_t)page_index_offsets_disk_size;
+	env->page_index_disk_size += (int64_t)page_index_disk_size;
 
 	/* Data size is consistent with space.bsize. */
 	if (lsm->index_id == 0)
@@ -776,9 +768,7 @@ vy_lsm_remove_run(struct vy_lsm *lsm, struct vy_run *run)
 	struct vy_lsm_env *env = lsm->env;
 	size_t bloom_size = vy_run_bloom_size(run);
 	size_t page_index_size = run->page_index_size;
-	size_t page_index_index_disk_size = run->page_index_index_disk_size;
-	size_t page_index_btree_disk_size = run->page_index_btree_disk_size;
-	size_t page_index_offsets_disk_size = run->page_index_offsets_disk_size;
+	size_t page_index_disk_size = run->page_index_disk_size;
 
 	assert(lsm->run_count > 0);
 	assert(!rlist_empty(&run->in_lsm));
@@ -791,10 +781,7 @@ vy_lsm_remove_run(struct vy_lsm *lsm, struct vy_run *run)
 	lsm->page_index_size -= page_index_size;
 
 	env->bloom_size -= bloom_size;
-	env->page_index_size -= page_index_size;
-	env->page_index_index_disk_size -= (int64_t)page_index_index_disk_size;
-	env->page_index_btree_disk_size -= (int64_t)page_index_btree_disk_size;
-	env->page_index_offsets_disk_size -= (int64_t)page_index_offsets_disk_size;
+	env->page_index_disk_size -= (int64_t)page_index_disk_size;
 
 	/* Data size is consistent with space.bsize. */
 	if (lsm->index_id == 0)
@@ -1120,11 +1107,7 @@ vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range,
 	struct tuple_format *key_format = lsm->env->key_format;
 
 	const char *split_key_raw;
-	bool needs_split;
-	if (vy_range_needs_split(range, vy_lsm_range_size(lsm),
-				 &split_key_raw, &needs_split) != 0)
-		return -1;
-	if (!needs_split)
+	if (!vy_range_needs_split(range, vy_lsm_range_size(lsm), &split_key_raw))
 		return 0;
 
 	/* Split a range in two parts. */
@@ -1136,7 +1119,6 @@ vy_lsm_split_range(struct vy_lsm *lsm, struct vy_range *range,
 	struct vy_entry split_key;
 	split_key = vy_entry_key_from_msgpack(key_format, lsm->cmp_def,
 					      split_key_raw);
-	free((char *)split_key_raw);
 	if (split_key.stmt == NULL)
 		goto fail;
 
@@ -1355,11 +1337,8 @@ vy_lsm_quantile(struct vy_lsm *lsm, double level,
 		if (!rlist_empty(&range->slices)) {
 			struct vy_slice *slice = rlist_last_entry(
 				&range->slices, struct vy_slice, in_range);
-			int64_t count;
-			if (vy_run_estimate_stmt_count(slice->run, range_begin,
-						       range_end, &count) != 0)
-				return -1;
-			total += count;
+			total += vy_run_estimate_stmt_count(slice->run, cmp_def,
+							    range_begin, range_end);
 		}
 		if (range == last_range)
 			break;
@@ -1381,36 +1360,33 @@ vy_lsm_quantile(struct vy_lsm *lsm, double level,
 			range == first_range ? begin : range->begin;
 		struct vy_entry range_end =
 			range == last_range ? end : range->end;
-		if (rlist_empty(&range->slices))
-			continue;
-		struct vy_slice *slice = rlist_last_entry(
-			&range->slices, struct vy_slice, in_range);
-		int64_t count;
-		if (vy_run_estimate_stmt_count(slice->run, range_begin,
-					       range_end, &count) != 0)
-			return -1;
-		if (offset >= count) {
+		if (!rlist_empty(&range->slices)) {
+			struct vy_slice *slice = rlist_last_entry(
+				&range->slices, struct vy_slice, in_range);
+			int64_t count = vy_run_estimate_stmt_count(slice->run, cmp_def,
+						range_begin, range_end);
+			if (offset < count) {
+				key = vy_run_estimate_key_at(slice->run, cmp_def,
+							     range_begin, offset);
+				break;
+			}
 			offset -= count;
-			continue;
 		}
-		if (vy_run_estimate_key_at(slice->run, range_begin,
-					   offset, &key) != 0)
-			return -1;
-		break;
+		if (range == last_range)
+			break;
 	}
 	if (key == NULL)
 		return 0;
 
-	const char *key_to_free = key;
 	/*
 	 * Since it is an estimate, the found key may be outside the target
 	 * range, in which case we ignore it.
 	 */
 	if (vy_entry_compare_with_raw_key(begin, key, HINT_NONE, cmp_def) > 0)
-		goto out;
+		return 0;
 	if (vy_stmt_key_part_count(end.stmt, cmp_def) > 0 &&
 	    vy_entry_compare_with_raw_key(end, key, HINT_NONE, cmp_def) <= 0)
-	    	goto out;
+		return 0;
 	/*
 	 * Keys stored in runs are extended with primary key parts so we
 	 * can't just return the found key to the user, at least, not if
@@ -1429,7 +1405,5 @@ vy_lsm_quantile(struct vy_lsm *lsm, double level,
 	       key, key_end - key);
 	*quantile_key = (const char *)buf;
 	*quantile_key_size = size;
-out:
-	free((char *)key_to_free);
 	return 0;
 }

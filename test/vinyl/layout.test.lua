@@ -43,13 +43,21 @@ test_run:cmd("setopt delimiter ';'")
 for i, path in pairs(files) do
     local suffix = string.gsub(path, '.*%.', '')
     if suffix ~= 'snap' and suffix ~= 'xlog'
-    and suffix ~= 'btree' and suffix ~= 'index_offsets'
     and suffix ~= 'inprogress' then
         local rows = {}
         local i = 1
         for lsn, row in xlog.pairs(path) do
             if row.BODY.bloom_filter ~= nil then
                 row.BODY.bloom_filter = '<bloom_filter>'
+            end
+            if row.HEADER.type == 'BTREE' then
+                local body = row.BODY[1]
+                if type(body) == 'table' then
+                    body[6] = '<root reference>'
+                    body[9] = '<manifest offset>'
+                else
+                    row.BODY[1] = '<node>'
+                end
             end
             rows[i] = row
             i = i + 1

@@ -497,9 +497,8 @@ vy_write_iterator_new_slice(struct vy_stmt_stream *vstream,
 	struct vy_write_src *src = vy_write_iterator_new_src(stream);
 	if (src == NULL)
 		return -1;
-	if (vy_slice_stream_open(&src->slice_stream, slice, stream->cmp_def,
-				 disk_format) != 0)
-		return -1;
+	vy_slice_stream_open(&src->slice_stream, slice, stream->cmp_def,
+			     disk_format);
 	return 0;
 }
 

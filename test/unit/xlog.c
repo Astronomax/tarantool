@@ -145,15 +145,54 @@ test_dynamic_sized_ibuf(void)
 	footer();
 }
 
+/** Read one large transaction in chunks that cross internal buffer boundaries. */
+static void
+test_stream_plain_tx(void)
+{
+	header();
+	plan(3);
+	struct xlog log;
+	char dirname[] = "./xlog.XXXXXX";
+	create_xlog(&log, dirname);
+	char path[PATH_MAX];
+	strlcpy(path, log.filename, sizeof(path));
+	log.opts.no_compression = true;
+	xlog_tx_begin(&log);
+	for (int i = 0; i < 2048; i++)
+		write_1k(&log);
+	fail_if(xlog_tx_commit(&log) < 0 || xlog_close(&log) < 0);
+
+	struct xlog_cursor cursor;
+	fail_if(xlog_cursor_open_header(&cursor, path) < 0);
+	struct xlog_tx_stream stream;
+	fail_if(xlog_tx_stream_open(&stream, &cursor) < 0);
+	uint32_t size = stream.remaining;
+	size_t peak = 0;
+	while (stream.remaining > 0) {
+		fail_if(xlog_tx_stream_read(&stream, MIN(8191U, stream.remaining)) == NULL);
+		peak = MAX(peak, ibuf_capacity(&cursor.rbuf));
+	}
+	is(stream.crc, stream.expected_crc, "streamed CRC matches the writer");
+	ok(peak < size, "bounded read buffer throughout the transaction");
+	ok(xlog_cursor_next_tx(&cursor) == 1 && xlog_cursor_is_eof(&cursor),
+	   "the next read reaches the EOF marker");
+	xlog_cursor_close(&cursor, false);
+	unlink(path);
+	rmdir(dirname);
+	check_plan();
+	footer();
+}
+
 int
 main(void)
 {
-	plan(1);
+	plan(2);
 	crc32_init();
 	memory_init();
 	random_init();
 
 	test_dynamic_sized_ibuf();
+	test_stream_plain_tx();
 
 	random_free();
 	memory_free();

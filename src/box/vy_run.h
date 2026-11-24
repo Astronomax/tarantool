@@ -77,8 +77,7 @@ struct vy_run_env {
 	 */
 	bool initial_join;
 	/** Cache environment for vy_page_index objects. */
-	struct vy_page_index_cache_env page_index_cache_env;
-	struct vy_page_info_cache_env page_info_cache_env;
+	struct vy_page_index_env page_index_env;
 };
 
 /**
@@ -101,13 +100,13 @@ struct vy_run_info {
 	struct vy_stmt_stat stmt_stat;
 	/**
 	 * Index file format version
-	 * (0/1 = legacy min keys in .index, 2 = current).
+	 * (0/1: keys in .index, 2: separate .btree, 3: blocked B+ tree).
 	 */
 	uint32_t index_format_version;
 };
 
 /**
- * Run page metadata. Is a written to a file as a single chunk.
+ * Descriptor of one independently readable data page.
  */
 struct vy_page_info {
 	/** Offset of page data in the run file. */
@@ -141,11 +140,7 @@ struct vy_run {
 	/** Size of memory used for storing page index. */
 	size_t page_index_size;
 	/** Size of run metadata index file on disk (.index). */
-	size_t page_index_index_disk_size;
-	/** Size of B-tree page index file on disk (.btree). */
-	size_t page_index_btree_disk_size;
-	/** Size of page info offsets file on disk (.index_offsets). */
-	size_t page_index_offsets_disk_size;
+	size_t page_index_disk_size;
 	/** Max LSN stored on disk. */
 	int64_t dump_lsn;
 	/**
@@ -234,17 +229,7 @@ struct vy_slice {
 	uint32_t last_page_no;
 	/** An estimate of the number of statements in this slice. */
 	struct vy_disk_stmt_counter count;
-	/**
-	 * Min keys of the first and median page in the slice span, copied
-	 * into the slice at creation time inside vy_slice_new() (via
-	 * vy_run_page_info, may yield). Used by vy_range_needs_split()
-	 * without yielding.
-	 */
-	bool has_split_page_keys;
-	char *split_first_min_key;
-	hint_t split_first_min_key_hint;
-	char *split_mid_min_key;
-	hint_t split_mid_min_key_hint;
+
 };
 
 /** Position of a particular stmt in vy_run. */
@@ -309,7 +294,6 @@ struct vy_run_iterator {
 	 */
 	struct vy_page *curr_page;
 	struct vy_page *prev_page;
-	struct vy_page_index_array_iterator page_info_it;
 	/** Is false until first .._get or .._next_.. method is called */
 	bool search_started;
 };
@@ -362,21 +346,13 @@ void
 vy_run_env_enable_coio(struct vy_run_env *env);
 
 /**
- * Execute a task on behalf of a reader thread.
- * If coio is disabled (e.g. during recovery), executes synchronously.
- */
-int
-vy_run_env_coio_call(struct vy_run_env *env, struct cbus_call_msg *msg,
-		     cbus_call_f func);
-
-/**
  * Return the size of a run bloom filter.
  */
 size_t
 vy_run_bloom_size(struct vy_run *run);
 
-int
-vy_run_page_info(struct vy_run *run, uint32_t pos, struct vy_page_info *result);
+ZSTD_DStream *
+vy_run_env_get_zdctx(struct vy_run_env *env);
 
 static inline bool
 vy_run_is_empty(struct vy_run *run)
@@ -409,9 +385,9 @@ vy_run_unref(struct vy_run *run)
  * With a reasonable degree of error, return the number of statements
  * stored in the given range.
  */
-int
-vy_run_estimate_stmt_count(struct vy_run *run, struct vy_entry begin,
-			   struct vy_entry end, int64_t *result);
+int64_t
+vy_run_estimate_stmt_count(struct vy_run *run, struct key_def *cmp_def,
+			   struct vy_entry begin, struct vy_entry end);
 
 /**
  * With a reasonable degree of error, return the key of the statement
@@ -419,9 +395,9 @@ vy_run_estimate_stmt_count(struct vy_run *run, struct vy_entry begin,
  *
  * The returned key belongs to the run so it must not be modified or freed.
  */
-int
-vy_run_estimate_key_at(struct vy_run *run, struct vy_entry begin,
-		       int64_t offset, const char **result);
+const char *
+vy_run_estimate_key_at(struct vy_run *run, struct key_def *cmp_def,
+		       struct vy_entry begin, int64_t offset);
 
 /**
  * Load run from disk
@@ -434,7 +410,8 @@ vy_run_estimate_key_at(struct vy_run *run, struct vy_entry begin,
  */
 int
 vy_run_recover(struct vy_run *run, const char *dir,
-	       uint32_t space_id, uint32_t iid, struct key_def *cmp_def);
+	       uint32_t space_id, uint32_t iid, struct key_def *cmp_def,
+	       bool force_recovery);
 
 /**
  * Rebuild run index
@@ -520,10 +497,10 @@ vy_run_remove_files(const char *dir, uint32_t space_id,
 /**
  * Allocate a new run slice.
  * This function increments @run->refs.
- * Loads first/median page min keys for vy_range_needs_split(); may yield.
+ * Uses resident key samples to estimate the size without yielding.
  */
 struct vy_slice *
-vy_slice_new(int64_t id, struct vy_run *run,
+vy_slice_new(int64_t id, struct vy_run *run, struct key_def *cmp_def,
 	     struct vy_entry begin, struct vy_entry end);
 
 /**
@@ -626,8 +603,8 @@ struct vy_slice_stream {
 	/** Current position */
 	uint32_t page_no;
 	uint32_t pos_in_page;
-	struct vy_page_info_block page_info_block;
-	bool has_page_info_block;
+	uint32_t last_page_no;
+	struct vy_index_node *index_leaf;
 	/** Last page read */
 	struct vy_page *page;
 	/** The last tuple returned to user */
@@ -648,7 +625,7 @@ struct vy_slice_stream {
 /**
  * Open a run stream. Use vy_stmt_stream api for further work.
  */
-int
+void
 vy_slice_stream_open(struct vy_slice_stream *stream, struct vy_slice *slice,
 		     struct key_def *cmp_def, struct tuple_format *format);
 
@@ -678,20 +655,12 @@ struct vy_run_writer {
 	 * dumped.
 	 */
 	uint64_t page_size;
-	/**
-	 * Temporary page info array built during writing.
-	 * Freed when the writer is destroyed.
-	 */
-	struct vy_page_info *page_info;
-	/**
-	 * Temporary page index entries built during writing.
-	 * Freed when the writer is destroyed.
-	 */
-	struct vy_page_index_entry *page_index_entries;
-	/**
-	 * Current page info capacity. Can grow with page number.
-	 */
-	uint32_t page_info_capacity;
+	/** Page under construction and its owned fence key. */
+	struct vy_page_info page;
+	char *page_min_key;
+	/** Streams completed nodes to the index alongside the data pages. */
+	struct vy_page_index_writer *index;
+	struct xlog index_xlog;
 	/** Don't use compression while writing xlog files. */
 	bool no_compression;
 	/** Xlog to write data. */
